@@ -1,0 +1,36 @@
+name: PHP Code Standards
+
+on:
+  workflow_call:
+    inputs:
+      php_version:
+        description: PHP version to use
+        required: false
+        type: string
+        default: '8.2'
+
+jobs:
+  phpcs:
+    name: PHP_CodeSniffer
+    runs-on: ubuntu-latest
+    if: vars.ENABLE_PHPCS != 'false'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up PHP ${{ inputs.php_version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php_version }}
+          tools: composer, cs2pr
+
+      - name: Install PHPCS and VIP ruleset
+        run: |
+          composer require --dev \
+            automattic/vipwpcs:^3 \
+            dealerdirect/phpcodesniffer-composer-installer \
+            --no-interaction --no-progress
+
+      - name: Run PHPCS
+        run: vendor/bin/phpcs --report=checkstyle | cs2pr
