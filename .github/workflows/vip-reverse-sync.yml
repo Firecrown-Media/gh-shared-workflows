@@ -1,0 +1,136 @@
+name: Reverse Sync from VIP
+
+on:
+  workflow_call:
+    inputs:
+      source_repo:
+        description: 'VIP repo to check (e.g. wpcomvip/astronomy-com)'
+        required: true
+        type: string
+      source_branch:
+        description: 'VIP branch to check (e.g. production)'
+        required: true
+        type: string
+      target_branch:
+        description: 'Branch in the calling repo to target for the PR'
+        required: false
+        type: string
+        default: 'main'
+    secrets:
+      deploy_token:
+        description: 'SSH private key with read access to the VIP repo'
+        required: true
+      github_token:
+        description: 'GitHub token for creating PRs and posting comments'
+        required: true
+
+jobs:
+  reverse-sync:
+    name: Check ${{ inputs.source_repo }}@${{ inputs.source_branch }} for hotfixes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup SSH deploy key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.deploy_token }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Add VIP remote and fetch
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
+        run: |
+          git remote add vip "git@github.com:${{ inputs.source_repo }}.git"
+          git fetch vip ${{ inputs.source_branch }}
+
+      - name: Check for divergence
+        id: divergence
+        run: |
+          COMMITS=$(git log HEAD..vip/${{ inputs.source_branch }} --oneline)
+          if [ -z "$COMMITS" ]; then
+            echo "VIP is in sync — nothing to do."
+            echo "has_divergence=false" >> $GITHUB_OUTPUT
+          else
+            echo "VIP has commits not in ${{ inputs.target_branch }}:"
+            echo "$COMMITS"
+            echo "has_divergence=true" >> $GITHUB_OUTPUT
+            echo "commits<<EOF" >> $GITHUB_OUTPUT
+            echo "$COMMITS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for existing hotfix PR
+        id: existing_pr
+        if: steps.divergence.outputs.has_divergence == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.github_token }}
+        run: |
+          PR=$(gh pr list --label vip-hotfix --state open --json number,headRefName --jq '.[0]')
+          if [ -n "$PR" ]; then
+            PR_NUMBER=$(echo "$PR" | jq -r '.number')
+            PR_BRANCH=$(echo "$PR" | jq -r '.headRefName')
+            echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "pr_branch=$PR_BRANCH" >> $GITHUB_OUTPUT
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create hotfix branch (no open PR)
+        if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'false'
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
+          GH_TOKEN: ${{ secrets.github_token }}
+        run: |
+          BRANCH="vip-hotfix/$(date +'%Y-%m-%d')"
+          git checkout -b "$BRANCH" vip/${{ inputs.source_branch }}
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "chore: reverse sync VIP hotfix to ${{ inputs.target_branch }}" \
+            --base "${{ inputs.target_branch }}" \
+            --head "$BRANCH" \
+            --label "vip-hotfix" \
+            --body "## VIP Hotfix Reverse Sync
+
+          Commits found on \`${{ inputs.source_repo }}:${{ inputs.source_branch }}\` that are not in \`${{ inputs.target_branch }}\`:
+
+          \`\`\`
+          ${{ steps.divergence.outputs.commits }}
+          \`\`\`
+
+          ## After merging this PR
+
+          Propagate the hotfix to all branches:
+
+          \`\`\`bash
+          # Merge main into stage
+          git checkout stage && git merge main && git push
+
+          # Merge stage into develop
+          git checkout develop && git merge stage && git push
+          \`\`\`
+
+          Alternatively, cherry-pick only the hotfix commits if you do not want to cascade unrelated changes from main.
+
+          > This PR was opened automatically by the VIP reverse sync workflow."
+
+      - name: Update existing hotfix branch (open PR exists)
+        if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'true'
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
+          GH_TOKEN: ${{ secrets.github_token }}
+        run: |
+          BRANCH="${{ steps.existing_pr.outputs.pr_branch }}"
+          git push origin "vip/${{ inputs.source_branch }}:refs/heads/$BRANCH" --force-with-lease
+          gh pr comment "${{ steps.existing_pr.outputs.pr_number }}" \
+            --body "VIP has new commits not yet in \`${{ inputs.target_branch }}\`. This branch has been updated to include them:
+
+          \`\`\`
+          ${{ steps.divergence.outputs.commits }}
+          \`\`\`"
