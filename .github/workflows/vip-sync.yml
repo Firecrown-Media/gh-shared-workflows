@@ -52,6 +52,21 @@ jobs:
       - name: Add VIP remote
         run: git remote add vip "git@github.com:${{ inputs.target_repo }}.git"
 
+      - name: Fetch VIP branch
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
+        run: git fetch vip ${{ inputs.target_branch }}
+
+      - name: Check for VIP divergence
+        run: |
+          AHEAD=$(git log HEAD..vip/${{ inputs.target_branch }} --oneline)
+          if [ -n "$AHEAD" ]; then
+            echo "::error::VIP has commits not present in this branch:"
+            echo "$AHEAD"
+            echo "::error::Merge the reverse sync PR before pushing to VIP."
+            exit 1
+          fi
+
       - name: Push to VIP
         env:
           GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
