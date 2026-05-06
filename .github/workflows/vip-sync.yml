@@ -23,7 +23,7 @@ on:
         default: '20'
     secrets:
       deploy_token:
-        description: 'PAT with write access to the target wpcomvip repo'
+        description: 'SSH private key with write access to the target wpcomvip repo'
         required: true
 
 jobs:
@@ -42,10 +42,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Add VIP remote
+      - name: Setup SSH deploy key
         run: |
-          git remote add vip "https://x-access-token:${{ secrets.deploy_token }}@github.com/${{ inputs.target_repo }}.git"
+          mkdir -p ~/.ssh
+          echo "${{ secrets.deploy_token }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Add VIP remote
+        run: git remote add vip "git@github.com:${{ inputs.target_repo }}.git"
 
       - name: Push to VIP
-        run: |
-          git push vip "HEAD:refs/heads/${{ inputs.target_branch }}" --force
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
+        run: git push vip "HEAD:refs/heads/${{ inputs.target_branch }}" --force
