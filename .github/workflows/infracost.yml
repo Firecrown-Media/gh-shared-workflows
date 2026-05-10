@@ -1,0 +1,48 @@
+name: Infracost
+
+on:
+  workflow_call:
+    inputs:
+      terraform_dir:
+        description: 'Directory containing Terraform files'
+        type: string
+        default: 'terraform'
+      tfvars_file:
+        description: '.tfvars filename (looked up inside terraform_dir)'
+        type: string
+        default: 'prod.tfvars'
+    secrets:
+      INFRACOST_API_KEY:
+        required: true
+
+jobs:
+  infracost:
+    name: Infracost Cost Estimate
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.3.1
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Run Infracost breakdown
+        run: |
+          infracost breakdown \
+            --path ${{ inputs.terraform_dir }} \
+            --terraform-var-file ${{ inputs.terraform_dir }}/${{ inputs.tfvars_file }} \
+            --format json \
+            --out-file /tmp/infracost.json
+
+      - name: Post Infracost comment
+        uses: infracost/actions/comment@v3
+        with:
+          path: /tmp/infracost.json
+          behavior: update
+          github-token: ${{ secrets.GITHUB_TOKEN }}
