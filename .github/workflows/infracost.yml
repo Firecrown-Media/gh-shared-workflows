@@ -8,9 +8,9 @@ on:
         type: string
         default: 'terraform'
       tfvars_file:
-        description: '.tfvars filename (looked up inside terraform_dir)'
+        description: '.tfvars file path relative to repo root (e.g. terraform/prod.tfvars)'
         type: string
-        default: 'prod.tfvars'
+        default: 'terraform/prod.tfvars'
     secrets:
       INFRACOST_API_KEY:
         required: true
@@ -36,7 +36,7 @@ jobs:
         run: |
           infracost breakdown \
             --path ${{ inputs.terraform_dir }} \
-            --terraform-var-file ${{ inputs.terraform_dir }}/${{ inputs.tfvars_file }} \
+            --terraform-var-file ${{ inputs.tfvars_file }} \
             --format json \
             --out-file /tmp/infracost.json
 
