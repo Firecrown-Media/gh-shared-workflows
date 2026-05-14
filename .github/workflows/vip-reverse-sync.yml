@@ -82,6 +82,16 @@ jobs:
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Ensure vip-hotfix label exists
+        if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.gh_token }}
+        run: |
+          gh label create vip-hotfix \
+            --color FF6B35 \
+            --description "Reverse-sync PR from VIP — review and promote down to stage/develop" \
+            2>/dev/null || true
+
       - name: Create hotfix branch (no open PR)
         if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'false'
         env:
