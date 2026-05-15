@@ -63,6 +63,7 @@ jobs:
         run: git fetch vip ${{ inputs.target_branch }}
 
       - name: Check for VIP divergence
+        id: divergence_check
         if: inputs.check_vip_divergence
         run: |
           AHEAD=$(git log HEAD..vip/${{ inputs.target_branch }} --oneline)
@@ -70,6 +71,9 @@ jobs:
             echo "::error::VIP has commits not present in this branch:"
             echo "$AHEAD"
             echo "::error::Merge the reverse sync PR before pushing to VIP."
+            echo "ahead_commits<<EOF" >> $GITHUB_OUTPUT
+            echo "$AHEAD" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
             exit 1
           fi
 
@@ -77,3 +81,82 @@ jobs:
         env:
           GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
         run: git push vip "HEAD:refs/heads/${{ inputs.target_branch }}" --force
+
+      - name: Notify Slack — divergence failure
+        if: failure() && steps.divergence_check.outcome == 'failure' && env.SLACK_WEBHOOK_URL != ''
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_VIP_PIPELINES_WEBHOOK }}
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          TARGET_BRANCH="${{ inputs.target_branch }}"
+          TARGET_REPO="${{ inputs.target_repo }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          AHEAD="${{ steps.divergence_check.outputs.ahead_commits }}"
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO_NAME" \
+            --arg branch "$TARGET_BRANCH" \
+            --arg target "$TARGET_REPO" \
+            --arg ahead "$AHEAD" \
+            --arg run_url "$RUN_URL" \
+            --arg run_num "${{ github.run_number }}" \
+            '{
+              text: "⚠️ \($repo) \($branch) sync blocked — VIP has commits Firecrown doesn'\''t",
+              blocks: [
+                { type: "section", text: { type: "mrkdwn", text: "⚠️ *\($repo)* `\($branch)` sync blocked — VIP has commits Firecrown doesn'\''t:\n```\n\($ahead)\n```\nResolve: `gh workflow run vip-reverse-sync.yml --repo Firecrown-Media/\($repo) --ref main`" } },
+                { type: "context", elements: [ { type: "mrkdwn", text: "Run #\($run_num) · <\($run_url)|view logs>" } ] }
+              ]
+            }')
+          curl -fsS -X POST -H 'content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+
+      - name: Notify Slack — sync failure (other)
+        if: failure() && steps.divergence_check.outcome != 'failure' && env.SLACK_WEBHOOK_URL != ''
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_VIP_PIPELINES_WEBHOOK }}
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          TARGET_BRANCH="${{ inputs.target_branch }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO_NAME" \
+            --arg branch "$TARGET_BRANCH" \
+            --arg run_url "$RUN_URL" \
+            --arg run_num "${{ github.run_number }}" \
+            '{
+              text: "❌ \($repo) \($branch) sync failed",
+              blocks: [
+                { type: "section", text: { type: "mrkdwn", text: "❌ *\($repo)* `\($branch)` sync failed" } },
+                { type: "context", elements: [ { type: "mrkdwn", text: "Run #\($run_num) · <\($run_url)|view logs>" } ] }
+              ]
+            }')
+          curl -fsS -X POST -H 'content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+
+      - name: Notify Slack — sync success
+        if: success() && env.SLACK_WEBHOOK_URL != ''
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_VIP_PIPELINES_WEBHOOK }}
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          TARGET_BRANCH="${{ inputs.target_branch }}"
+          TARGET_REPO="${{ inputs.target_repo }}"
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO_NAME" \
+            --arg target "$TARGET_REPO" \
+            --arg branch "$TARGET_BRANCH" \
+            --arg sha "$SHA_SHORT" \
+            --arg msg "$COMMIT_MSG" \
+            --arg run_url "$RUN_URL" \
+            --arg run_num "${{ github.run_number }}" \
+            '{
+              text: "✅ \($repo) → \($target):\($branch)",
+              blocks: [
+                { type: "section", text: { type: "mrkdwn", text: "✅ *\($repo)* → `\($target):\($branch)`\n`\($sha)` \($msg)" } },
+                { type: "context", elements: [ { type: "mrkdwn", text: "Run #\($run_num) · <\($run_url)|view logs>" } ] }
+              ]
+            }')
+          curl -fsS -X POST -H 'content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
