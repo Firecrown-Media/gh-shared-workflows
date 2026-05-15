@@ -26,10 +26,6 @@ on:
         required: false
         type: boolean
         default: true
-    secrets:
-      deploy_token:
-        description: 'SSH private key with write access to the target wpcomvip repo'
-        required: true
 
 jobs:
   sync:
@@ -50,7 +46,7 @@ jobs:
       - name: Setup SSH deploy key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.deploy_token }}" > ~/.ssh/deploy_key
+          echo "${{ secrets.VIP_DEPLOY_TOKEN }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 

@@ -16,13 +16,6 @@ on:
         required: false
         type: string
         default: 'main'
-    secrets:
-      deploy_token:
-        description: 'SSH private key with read access to the VIP repo'
-        required: true
-      gh_token:
-        description: 'GitHub token for creating PRs and posting comments'
-        required: true
 
 jobs:
   reverse-sync:
@@ -38,7 +31,7 @@ jobs:
       - name: Setup SSH deploy key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.deploy_token }}" > ~/.ssh/deploy_key
+          echo "${{ secrets.VIP_DEPLOY_TOKEN }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
@@ -69,7 +62,7 @@ jobs:
         id: existing_pr
         if: steps.divergence.outputs.has_divergence == 'true'
         env:
-          GH_TOKEN: ${{ secrets.gh_token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PR=$(gh pr list --label vip-hotfix --state open --json number,headRefName,url --jq '.[0]')
           if [ -n "$PR" ]; then
@@ -87,7 +80,7 @@ jobs:
       - name: Ensure vip-hotfix label exists
         if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'false'
         env:
-          GH_TOKEN: ${{ secrets.gh_token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh label create vip-hotfix \
             --color FF6B35 \
@@ -99,7 +92,7 @@ jobs:
         if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'false'
         env:
           GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
-          GH_TOKEN: ${{ secrets.gh_token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="vip-hotfix/$(date +'%Y-%m-%d')"
           git checkout -b "$BRANCH" vip/${{ inputs.source_branch }}
@@ -166,7 +159,7 @@ jobs:
         if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'true'
         env:
           GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
-          GH_TOKEN: ${{ secrets.gh_token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ steps.existing_pr.outputs.pr_branch }}"
           git push origin "vip/${{ inputs.source_branch }}:refs/heads/$BRANCH" --force-with-lease
