@@ -71,12 +71,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.gh_token }}
         run: |
-          PR=$(gh pr list --label vip-hotfix --state open --json number,headRefName --jq '.[0]')
+          PR=$(gh pr list --label vip-hotfix --state open --json number,headRefName,url --jq '.[0]')
           if [ -n "$PR" ]; then
             PR_NUMBER=$(echo "$PR" | jq -r '.number')
             PR_BRANCH=$(echo "$PR" | jq -r '.headRefName')
+            PR_URL=$(echo "$PR" | jq -r '.url')
             echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
             echo "pr_branch=$PR_BRANCH" >> $GITHUB_OUTPUT
+            echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
             echo "exists=true" >> $GITHUB_OUTPUT
           else
             echo "exists=false" >> $GITHUB_OUTPUT
@@ -93,6 +95,7 @@ jobs:
             2>/dev/null || true
 
       - name: Create hotfix branch (no open PR)
+        id: create_hotfix
         if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'false'
         env:
           GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy_key
@@ -101,7 +104,7 @@ jobs:
           BRANCH="vip-hotfix/$(date +'%Y-%m-%d')"
           git checkout -b "$BRANCH" vip/${{ inputs.source_branch }}
           git push origin "$BRANCH"
-          gh pr create \
+          PR_URL=$(gh pr create \
             --title "chore: reverse sync VIP hotfix to ${{ inputs.target_branch }}" \
             --base "${{ inputs.target_branch }}" \
             --head "$BRANCH" \
@@ -128,7 +131,36 @@ jobs:
 
           Alternatively, cherry-pick only the hotfix commits if you do not want to cascade unrelated changes from main.
 
-          > This PR was opened automatically by the VIP reverse sync workflow."
+          > This PR was opened automatically by the VIP reverse sync workflow.")
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+      - name: Notify Slack — hotfix PR opened
+        if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'false' && env.SLACK_WEBHOOK_URL != ''
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_VIP_PIPELINES_WEBHOOK }}
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          PR_URL="${{ steps.create_hotfix.outputs.pr_url }}"
+          COMMITS="${{ steps.divergence.outputs.commits }}"
+          COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO_NAME" \
+            --arg pr "$PR_URL" \
+            --arg commits "$COMMITS" \
+            --arg count "$COUNT" \
+            --arg source "${{ inputs.source_repo }}:${{ inputs.source_branch }}" \
+            --arg run_url "$RUN_URL" \
+            --arg run_num "${{ github.run_number }}" \
+            '{
+              text: "🔄 \($repo) — VIP hotfix PR opened",
+              blocks: [
+                { type: "section", text: { type: "mrkdwn", text: "🔄 *\($repo)* — VIP hotfix PR opened\n\($count) commit(s) from `\($source)`:\n```\n\($commits)\n```" } },
+                { type: "context", elements: [ { type: "mrkdwn", text: "<\($pr)|view PR> · <\($run_url)|view run>" } ] }
+              ]
+            }')
+          curl -fsS -X POST -H 'content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
 
       - name: Update existing hotfix branch (open PR exists)
         if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'true'
@@ -144,3 +176,28 @@ jobs:
           \`\`\`
           ${{ steps.divergence.outputs.commits }}
           \`\`\`"
+
+      - name: Notify Slack — hotfix PR updated
+        if: steps.divergence.outputs.has_divergence == 'true' && steps.existing_pr.outputs.exists == 'true' && env.SLACK_WEBHOOK_URL != ''
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_VIP_PIPELINES_WEBHOOK }}
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          PR_URL="${{ steps.existing_pr.outputs.pr_url }}"
+          COMMITS="${{ steps.divergence.outputs.commits }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO_NAME" \
+            --arg pr "$PR_URL" \
+            --arg commits "$COMMITS" \
+            --arg run_url "$RUN_URL" \
+            --arg run_num "${{ github.run_number }}" \
+            '{
+              text: "🔄 \($repo) — existing hotfix PR updated",
+              blocks: [
+                { type: "section", text: { type: "mrkdwn", text: "🔄 *\($repo)* — existing hotfix PR updated with new VIP commits\n```\n\($commits)\n```" } },
+                { type: "context", elements: [ { type: "mrkdwn", text: "<\($pr)|view PR> · <\($run_url)|view run>" } ] }
+              ]
+            }')
+          curl -fsS -X POST -H 'content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
