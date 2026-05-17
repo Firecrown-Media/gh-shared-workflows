@@ -62,15 +62,21 @@ jobs:
           COMPOSER_ALLOW_SUPERUSER: '1'
         run: |
           set -euo pipefail
-          # Composer: install --no-dev for every composer.json under deployable paths,
-          # excluding anything already inside a vendor/ directory.
-          mapfile -t composer_files < <(
-            find plugins themes mu-plugins client-mu-plugins private -type f -name composer.json 2>/dev/null \
+          # Composer: install ONLY where composer.lock exists. A lockfile is
+          # composer's contract that downstream installers can reproduce the
+          # dependency tree deterministically. composer.json without a lock
+          # often references dev-branches that no longer exist upstream
+          # (real example: plugins/simple-tags requires dev-main of a package
+          # that only ships dev-master), so we treat the shipped vendor/ as
+          # canonical for lockless plugins and skip them. The exclusion of
+          # /vendor/ paths prevents recursing into already-installed deps.
+          mapfile -t composer_locks < <(
+            find plugins themes mu-plugins client-mu-plugins private -type f -name composer.lock 2>/dev/null \
               | grep -v '/vendor/' || true
           )
-          for cf in "${composer_files[@]}"; do
-            [ -z "$cf" ] && continue
-            dir=$(dirname "$cf")
+          for lf in "${composer_locks[@]}"; do
+            [ -z "$lf" ] && continue
+            dir=$(dirname "$lf")
             echo "::group::composer install in $dir"
             composer install --no-dev --optimize-autoloader --working-dir="$dir" || {
               echo "::error::composer install failed in $dir"
@@ -78,14 +84,31 @@ jobs:
             }
             echo "::endgroup::"
           done
-          # NPM: run `build` script wherever a package.json defines one. Skip node_modules.
-          mapfile -t package_files < <(
-            find plugins themes mu-plugins client-mu-plugins -type f -name package.json 2>/dev/null \
+          # Report (don't fail) on composer.json without a lockfile so it's
+          # visible in the run log.
+          mapfile -t lockless < <(
+            find plugins themes mu-plugins client-mu-plugins private -type f -name composer.json 2>/dev/null \
+              | grep -v '/vendor/' || true
+          )
+          for cf in "${lockless[@]}"; do
+            [ -z "$cf" ] && continue
+            dir=$(dirname "$cf")
+            if [ ! -f "$dir/composer.lock" ]; then
+              echo "::notice::skipping $dir — composer.json present but no composer.lock; relying on shipped vendor/"
+            fi
+          done
+          # NPM: build ONLY where package-lock.json exists AND scripts.build is
+          # defined. Same gating principle as composer: a lockfile means the
+          # author intended downstream builds to reproduce.
+          mapfile -t npm_locks < <(
+            find plugins themes mu-plugins client-mu-plugins -type f -name package-lock.json 2>/dev/null \
               | grep -v '/node_modules/' || true
           )
-          for pf in "${package_files[@]}"; do
-            [ -z "$pf" ] && continue
-            dir=$(dirname "$pf")
+          for plf in "${npm_locks[@]}"; do
+            [ -z "$plf" ] && continue
+            dir=$(dirname "$plf")
+            pf="$dir/package.json"
+            [ -f "$pf" ] || continue
             if jq -e '.scripts.build // empty' "$pf" > /dev/null 2>&1; then
               echo "::group::npm build in $dir"
               ( cd "$dir" && npm ci --no-audit --no-fund && npm run build ) || {
@@ -93,8 +116,6 @@ jobs:
                 exit 1
               }
               echo "::endgroup::"
-            else
-              echo "skipping $dir (no build script)"
             fi
           done
 
