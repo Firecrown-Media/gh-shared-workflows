@@ -70,8 +70,12 @@ jobs:
           # that only ships dev-master), so we treat the shipped vendor/ as
           # canonical for lockless plugins and skip them. The exclusion of
           # /vendor/ paths prevents recursing into already-installed deps.
+          # -maxdepth 3 keeps us at plugins/<name>/composer.lock, themes/<name>/composer.lock,
+          # client-mu-plugins/<name>/composer.lock, etc. Anything deeper is a third-party
+          # dep tree shipped by the plugin author (e.g. plugins/foo/includes/svg-sanitizer/
+          # includes/phpunit/phpunit/composer.lock) — those should NOT be re-installed.
           mapfile -t composer_locks < <(
-            find plugins themes mu-plugins client-mu-plugins private -type f -name composer.lock 2>/dev/null \
+            find plugins themes mu-plugins client-mu-plugins private -maxdepth 3 -type f -name composer.lock 2>/dev/null \
               | grep -v '/vendor/' || true
           )
           for lf in "${composer_locks[@]}"; do
@@ -87,7 +91,7 @@ jobs:
           # Report (don't fail) on composer.json without a lockfile so it's
           # visible in the run log.
           mapfile -t lockless < <(
-            find plugins themes mu-plugins client-mu-plugins private -type f -name composer.json 2>/dev/null \
+            find plugins themes mu-plugins client-mu-plugins private -maxdepth 3 -type f -name composer.json 2>/dev/null \
               | grep -v '/vendor/' || true
           )
           for cf in "${lockless[@]}"; do
@@ -101,7 +105,7 @@ jobs:
           # defined. Same gating principle as composer: a lockfile means the
           # author intended downstream builds to reproduce.
           mapfile -t npm_locks < <(
-            find plugins themes mu-plugins client-mu-plugins -type f -name package-lock.json 2>/dev/null \
+            find plugins themes mu-plugins client-mu-plugins -maxdepth 3 -type f -name package-lock.json 2>/dev/null \
               | grep -v '/node_modules/' || true
           )
           for plf in "${npm_locks[@]}"; do
