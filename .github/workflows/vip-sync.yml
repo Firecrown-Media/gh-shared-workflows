@@ -78,7 +78,7 @@ jobs:
             [ -z "$lf" ] && continue
             dir=$(dirname "$lf")
             echo "::group::composer install in $dir"
-            composer install --no-dev --optimize-autoloader --working-dir="$dir" || {
+            composer install --no-dev --no-scripts --optimize-autoloader --working-dir="$dir" || {
               echo "::error::composer install failed in $dir"
               exit 1
             }
