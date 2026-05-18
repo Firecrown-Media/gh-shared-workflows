@@ -40,13 +40,52 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Find lockfiles
+        id: discover
+        run: |
+          # Locate every package-lock.json under deployable paths (skip
+          # node_modules and shipped third-party dep trees). -maxdepth 3
+          # mirrors the vip-sync.yml build step convention. The root-level
+          # lookup catches repos that DO have a top-level lockfile.
+          mapfile -t locks < <(
+            { find . -maxdepth 1 -name package-lock.json 2>/dev/null; \
+              find plugins themes mu-plugins client-mu-plugins -maxdepth 3 \
+                -name package-lock.json 2>/dev/null \
+                | grep -v '/node_modules/'; } || true
+          )
+          if [ "${#locks[@]}" -eq 0 ] || [ -z "${locks[0]:-}" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No package-lock.json files found — skipping npm audit. Expected for repos with no Node-based plugins or themes."
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            printf 'Found %d lockfile(s):\n' "${#locks[@]}"
+            printf '  %s\n' "${locks[@]}"
+            {
+              echo "lockfiles<<LOCKFILES_EOF"
+              printf '%s\n' "${locks[@]}"
+              echo "LOCKFILES_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Node
+        if: steps.discover.outputs.found == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: npm audit
-        run: npm audit --audit-level=high
+      - name: npm audit (per lockfile)
+        if: steps.discover.outputs.found == 'true'
+        run: |
+          set -uo pipefail
+          fail=0
+          while IFS= read -r lock; do
+            [ -z "$lock" ] && continue
+            dir=$(dirname "$lock")
+            echo "::group::npm audit in $dir"
+            ( cd "$dir" && npm audit --audit-level=high ) || fail=1
+            echo "::endgroup::"
+          done <<< "${{ steps.discover.outputs.lockfiles }}"
+          exit "$fail"
 
   secret-scan:
     name: Secret Scanning
