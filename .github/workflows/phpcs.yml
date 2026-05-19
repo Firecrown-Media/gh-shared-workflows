@@ -57,7 +57,9 @@ jobs:
           COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
           echo "Scanning $COUNT changed file(s):"
           echo "$FILES"
-          echo "$FILES" | xargs vendor/bin/phpcs --report=checkstyle | cs2pr
+          # -q suppresses phpcs's progress output ('. 1 / 1 (100%)') so cs2pr
+          # sees only the XML report on stdin.
+          echo "$FILES" | xargs vendor/bin/phpcs -q --report=checkstyle | cs2pr
 
       - name: Run PHPCS full scan
         if: inputs.scan_mode == 'full'
