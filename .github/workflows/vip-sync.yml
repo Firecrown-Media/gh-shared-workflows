@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -51,7 +51,7 @@ jobs:
           coverage: none
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node_version }}
 
@@ -263,9 +263,9 @@ jobs:
             --arg run_url "$RUN_URL" \
             --arg run_num "${{ github.run_number }}" \
             '{
-              text: "⚠️ \($repo) \($branch) sync blocked — VIP has commits Firecrown doesn’t",
+              text: "⚠️ \($repo) \($branch) sync blocked — VIP has commits Firecrown doesn't",
               blocks: [
-                { type: "section", text: { type: "mrkdwn", text: "⚠️ *\($repo)* `\($branch)` sync blocked — VIP has commits Firecrown doesn’t" } },
+                { type: "section", text: { type: "mrkdwn", text: "⚠️ *\($repo)* `\($branch)` sync blocked — VIP has commits Firecrown doesn't" } },
                 { type: "section", text: { type: "mrkdwn", text: ("`\($sha)` \($msg)\nby @\($actor)" + $pr_line) } },
                 { type: "section", text: { type: "mrkdwn", text: "VIP-only commits:" } },
                 { type: "rich_text", elements: [ { type: "rich_text_preformatted", elements: [ { type: "text", text: $ahead } ] } ] },
