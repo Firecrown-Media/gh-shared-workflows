@@ -45,9 +45,26 @@ jobs:
       - name: Check for divergence
         id: divergence
         run: |
-          COMMITS=$(git log HEAD..vip/${{ inputs.source_branch }} --oneline)
+          # Emit each commit as: SHA|author|subject. Pipe-separated so we can match
+          # author+subject jointly with a single fixed-string grep without regex
+          # escaping for the [bot] brackets in the author name.
+          ALL=$(git log HEAD..vip/${{ inputs.source_branch }} --pretty=format:'%H|%an|%s')
+
+          # Drop the vip-sync artifact-wrapper commits. The filter requires BOTH:
+          #   author == github-actions[bot]
+          #   message begins with "ci: build deploy artifacts"
+          # Using fixed-string match (-F) against the literal "|author|message-prefix"
+          # fragment that appears at the author/message boundary of the pretty
+          # format. If vip-sync.yml ever changes its commit message, update this
+          # filter to match.
+          FILTERED=$(echo "$ALL" | grep -vF '|github-actions[bot]|ci: build deploy artifacts' || true)
+
+          # Convert back to the `--oneline`-style output the rest of the workflow
+          # expects (7-char SHA + space + subject, one commit per line).
+          COMMITS=$(echo "$FILTERED" | awk -F'|' 'NF>=3 {printf "%s %s\n", substr($1,1,7), $3}')
+
           if [ -z "$COMMITS" ]; then
-            echo "VIP is in sync — nothing to do."
+            echo "VIP is in sync — nothing to do (after filtering artifact wrappers)."
             echo "has_divergence=false" >> $GITHUB_OUTPUT
           else
             echo "VIP has commits not in ${{ inputs.target_branch }}:"
