@@ -15,6 +15,18 @@ jobs:
     runs-on: ubuntu-latest
     if: vars.ENABLE_PHP_SECURITY != 'false'
 
+    # Private-package Composer auth via an ORG-OWNED GitHub App — no PATs, and
+    # nothing for teammates to hold. When the App secrets are present (org
+    # secrets, forwarded by the caller's `secrets: inherit`), CI mints a
+    # short-lived, read-only token so `composer install` can fetch private
+    # Firecrown Composer packages. Absent → the mint + auth steps are skipped
+    # and install behaves exactly as before (public deps only). The App is
+    # installed only on the private package repo(s) with Contents: read, so the
+    # minted token can only READ those repos regardless of which pipeline it's
+    # minted in.
+    env:
+      COMPOSER_APP_ID: ${{ secrets.COMPOSER_APP_ID }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -24,6 +36,19 @@ jobs:
         with:
           php-version: ${{ inputs.php_version }}
           tools: composer
+
+      - name: Mint Composer auth token (GitHub App)
+        id: composer_auth
+        if: ${{ env.COMPOSER_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.COMPOSER_APP_ID }}
+          private-key: ${{ secrets.COMPOSER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Configure Composer auth for private packages
+        if: ${{ steps.composer_auth.outputs.token != '' }}
+        run: composer config --global github-oauth.github.com "${{ steps.composer_auth.outputs.token }}"
 
       - name: Install dependencies
         run: composer install --no-interaction --no-progress
