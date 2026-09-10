@@ -62,10 +62,15 @@ jobs:
       # Composer will not run a plugin it has not been told to trust, and under
       # --no-interaction it ABORTS rather than prompting. The `lean` sites have no
       # composer.json at all, so there is no allow-plugins block to inherit and the
-      # require below has failed on every run those repos have ever had. The
-      # `full`-tier sites already carry the entry, where this is a no-op.
+      # require below has failed on every run those repos have ever had.
+      #
+      # --global is load-bearing, not tidiness: a repo-scoped `composer config`
+      # exits 1 with "File ./composer.json cannot be found in the current
+      # directory" on exactly the sites this is meant to fix. It also keeps CI from
+      # editing a site's committed composer.json. Verified locally against a bare
+      # directory, before and after.
       - name: Trust the PHPCS standards installer
-        run: composer config --no-plugins allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+        run: composer config --no-plugins --global allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
 
       - name: Install PHPCS and VIP ruleset
         run: |
