@@ -23,6 +23,17 @@ jobs:
       issues: write
       contents: read
 
+    # Private-package Composer auth via an ORG-OWNED GitHub App. This block is a
+    # straight port of the one added to security-scan.yml on 2026-07-08 (5cf95fc)
+    # and never applied to this sibling — `composer require` re-resolves the whole
+    # dependency tree, so on a site whose composer.json declares the private
+    # Firecrown-Media/firecrown-kserv package it dies cloning it ("Invalid username
+    # or token") long before it sniffs anything. Needs the caller to forward
+    # `secrets: inherit`; absent, the two steps below skip and behaviour is exactly
+    # what it is today.
+    env:
+      COMPOSER_APP_ID: ${{ secrets.COMPOSER_APP_ID }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -35,12 +46,55 @@ jobs:
           php-version: ${{ inputs.php_version }}
           tools: composer, cs2pr
 
+      - name: Mint Composer auth token (GitHub App)
+        id: composer_auth
+        if: ${{ env.COMPOSER_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.COMPOSER_APP_ID }}
+          private-key: ${{ secrets.COMPOSER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Configure Composer auth for private packages
+        if: ${{ steps.composer_auth.outputs.token != '' }}
+        run: composer config --global github-oauth.github.com "${{ steps.composer_auth.outputs.token }}"
+
+      # Composer will not run a plugin it has not been told to trust, and under
+      # --no-interaction it ABORTS rather than prompting. The `lean` sites have no
+      # composer.json at all, so there is no allow-plugins block to inherit and the
+      # require below has failed on every run those repos have ever had. The
+      # `full`-tier sites already carry the entry, where this is a no-op.
+      - name: Trust the PHPCS standards installer
+        run: composer config --no-plugins allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+
       - name: Install PHPCS and VIP ruleset
         run: |
           composer require --dev \
             automattic/vipwpcs:^3 \
             dealerdirect/phpcodesniffer-composer-installer \
             --no-interaction --no-progress
+
+      # A repo with no ruleset file gets phpcs's built-in default (PEAR), which on
+      # WordPress code produces a flood of irrelevant findings. Naming the VIP
+      # standard explicitly is the difference between "the scan works" and "the
+      # failure moved". A site that ships a ruleset keeps using its own — phpcs
+      # auto-discovers it, and passing --standard would override it.
+      - name: Resolve the PHPCS standard
+        id: standard
+        run: |
+          RULESET=""
+          for f in .phpcs.xml.dist .phpcs.xml phpcs.xml.dist phpcs.xml; do
+            if [ -f "$f" ]; then RULESET="$f"; break; fi
+          done
+          if [ -n "$RULESET" ]; then
+            echo "args=" >> "$GITHUB_OUTPUT"
+            echo "ruleset=repo" >> "$GITHUB_OUTPUT"
+            echo "Using this repository's own ruleset: $RULESET"
+          else
+            echo "args=--standard=WordPress-VIP-Go" >> "$GITHUB_OUTPUT"
+            echo "ruleset=fallback" >> "$GITHUB_OUTPUT"
+            echo "No ruleset in this repo — falling back to WordPress-VIP-Go."
+          fi
 
       - name: Run PHPCS delta scan
         if: inputs.scan_mode == 'delta'
@@ -59,14 +113,25 @@ jobs:
           echo "$FILES"
           # -q suppresses phpcs's progress output ('. 1 / 1 (100%)') so cs2pr
           # sees only the XML report on stdin.
-          echo "$FILES" | xargs vendor/bin/phpcs -q --report=checkstyle | cs2pr
+          echo "$FILES" | xargs vendor/bin/phpcs -q ${{ steps.standard.outputs.args }} --report=checkstyle | cs2pr
 
+      # Full mode takes its PATHS from the ruleset, not from the command line, so
+      # without one phpcs walks the entire checkout — vendor/, node_modules/ and
+      # every inherited theme the WPEngine migration dumped in. Refuse, rather than
+      # open a 60,000-character issue nobody can read.
       - name: Run PHPCS full scan
-        if: inputs.scan_mode == 'full'
+        if: inputs.scan_mode == 'full' && steps.standard.outputs.ruleset == 'repo'
         run: vendor/bin/phpcs --report=full > /tmp/phpcs-output.txt 2>&1 || true
 
+      - name: Explain why the full scan was skipped
+        if: inputs.scan_mode == 'full' && steps.standard.outputs.ruleset != 'repo'
+        run: |
+          echo "::warning::A full scan takes its paths from a ruleset, and this repo has none."
+          echo "Add a .phpcs.xml.dist here, or use the delta scan."
+
+
       - name: Create GitHub issue with full scan results
-        if: inputs.scan_mode == 'full'
+        if: inputs.scan_mode == 'full' && steps.standard.outputs.ruleset == 'repo'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
