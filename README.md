@@ -83,8 +83,52 @@ jobs:
 
 The following workflows predate the Terraform migration and are used by WordPress repos (e.g., `astronomy`):
 
-- `phpcs.yml` — PHP CodeSniffer linting
+- `phpcs.yml` — PHP CodeSniffer linting (see below; delta mode skips vendored third-party plugin directories)
 - `security-scan.yml` — security scanning
 - `ai-issue-agent.yml` — AI-assisted issue triage
 - `vip-sync.yml` — WordPress VIP sync
 - `vip-reverse-sync.yml` — WordPress VIP reverse sync
+
+### `phpcs.yml` — PHP_CodeSniffer
+
+`delta` mode (the default) lints the `.php` and `.js` files a pull request or push changes;
+`full` mode scans the paths in the repo's own ruleset and opens an issue with the results. A repo
+with no ruleset file falls back to `--standard=WordPress-VIP-Go`. The job is skipped when the
+`ENABLE_PHPCS` repository variable is `false`.
+
+**Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `php_version` | string | `8.2` | PHP version to use |
+| `scan_mode` | string | `delta` | `delta` scans changed files only; `full` scans the repo per its ruleset and opens an issue |
+| `lint_vendored_plugins` | boolean | `false` | Lint vendored plugin directories anyway, instead of skipping them (see below) |
+
+**Secrets:** callers forward `secrets: inherit` so the workflow can mint a GitHub App token
+(`COMPOSER_APP_ID` / `COMPOSER_APP_PRIVATE_KEY`) for private Composer packages. Without them those
+steps skip.
+
+**Vendored-plugin skip (`PHPCS_VENDORED_SKIP`, wpvip-fleet ADR-024).** Installing a third-party
+plugin into `plugins/<dir>/` would otherwise lint every file of someone else's code and turn the
+PR red. In `delta` mode, the files under `plugins/<dir>/` are dropped from the scan when a commit
+in the scan range carries the trailer
+
+```
+Plugin-Vendored: plugins/<dir>/
+```
+
+`garage/scripts/plugin-rollout.py` (in `wpvip-fleet`) writes it on the commits it builds. The
+trailer is honoured only when:
+
+- it is on a **non-merge** commit in the range (`origin/<base>..HEAD` on a pull request,
+  `<before>..<sha>` on a push);
+- it names **exactly one** directory level, matching `^plugins/[A-Za-z0-9._-]+/$`;
+- **every** path that commit changes is inside that directory;
+- the directory is **not first-party**: `plugins/fc-*`, `plugins/fw-*`, `plugins/firecrown-*` and
+  `plugins/kserv*` are always linted, with a `::warning::`.
+
+Once a directory is accepted, every changed file under it is skipped for that run, including
+files that other commits in the same range change there. A rejected trailer is reported as a
+`::warning::` with the reason, and its files are linted. Skipped files are counted in a
+`::notice::`. On a push whose `before` is all zeros (a new branch), no trailer is honoured. Set
+`lint_vendored_plugins: true` in a caller to lint vendored directories anyway.

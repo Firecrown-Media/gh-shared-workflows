@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: 'delta'
+      lint_vendored_plugins:
+        description: "Lint plugins/<dir>/ trees that a commit in the delta range declares third-party with a 'Plugin-Vendored: plugins/<dir>/' trailer (wpvip-fleet ADR-024). Default false: those files are skipped, with a notice."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   phpcs:
@@ -103,12 +108,149 @@ jobs:
 
       - name: Run PHPCS delta scan
         if: inputs.scan_mode == 'delta'
+        env:
+          PHPCS_EVENT_NAME: ${{ github.event_name }}
+          PHPCS_BASE_REF: ${{ github.base_ref }}
+          PHPCS_BEFORE: ${{ github.event.before }}
+          PHPCS_SHA: ${{ github.sha }}
+          LINT_VENDORED_PLUGINS: ${{ inputs.lint_vendored_plugins }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             FILES=$(git diff --name-only --diff-filter=ACMRT "origin/${{ github.base_ref }}...HEAD" | grep -E '\.(php|js)$' || true)
           else
             FILES=$(git diff --name-only --diff-filter=ACMRT "${{ github.event.before }}" "${{ github.sha }}" | grep -E '\.(php|js)$' || true)
           fi
+
+          # PHPCS_VENDORED_SKIP v1 — wpvip-fleet ADR-024
+          #
+          # A third-party plugin committed into plugins/<dir>/ is not ours to
+          # lint, and without this the delta scan sniffs every file of it, so the
+          # PR that installs it goes red on a caller that is otherwise green.
+          # garage/scripts/plugin-rollout.py marks such a commit with a trailer:
+          #
+          #   Plugin-Vendored: plugins/<dir>/
+          #
+          # A trailer is honoured only when ALL of these hold:
+          #   - it is on a non-merge commit inside the scan range;
+          #   - it names exactly one directory level, ^plugins/[A-Za-z0-9._-]+/$;
+          #   - every path that commit changes is inside that directory, so a
+          #     trailer cannot vouch for anything else in the same commit;
+          #   - the directory is not first-party (fc-, fw-, firecrown-, kserv):
+          #     those are always linted, with a warning.
+          # Any other trailer is rejected with a warning and its files are linted.
+          # Once a dir is accepted, every changed file under it is skipped for
+          # this run, whichever commit in the range changed it.
+          # Callers set lint_vendored_plugins: true to lint vendored dirs anyway.
+          #
+          # Written for `bash -e` with or without pipefail: no pipeline's status
+          # is relied on, every git call that can fail is inside an `if`, and a
+          # path is one line, so names with spaces survive.
+          NL=$'\n'
+          VENDORED_DIRS=()
+          VENDORED_RANGE=""
+          if [ "$PHPCS_EVENT_NAME" = "pull_request" ]; then
+            VENDORED_RANGE="origin/${PHPCS_BASE_REF}..HEAD"
+          elif [ -z "${PHPCS_BEFORE//0/}" ]; then
+            echo "::notice::event.before is empty or all zeros (a new branch push), so Plugin-Vendored trailers are not honoured; linting every changed file."
+          else
+            VENDORED_RANGE="${PHPCS_BEFORE}..${PHPCS_SHA}"
+          fi
+          VENDORED_COMMITS=""
+          if [ -n "$VENDORED_RANGE" ]; then
+            if ! VENDORED_COMMITS=$(git rev-list --no-merges "$VENDORED_RANGE" --); then
+              echo "::warning::Could not list the commits in $VENDORED_RANGE, so Plugin-Vendored trailers are not honoured; linting every changed file."
+              VENDORED_COMMITS=""
+            fi
+          fi
+          while IFS= read -r VC; do
+            if [ -z "$VC" ]; then continue; fi
+            VC_SHORT="${VC:0:12}"
+            if ! VC_VALUES=$(git log -1 --format='%(trailers:key=Plugin-Vendored,valueonly,unfold)' "$VC" --); then
+              echo "::warning::Could not read the trailers of $VC_SHORT; none of them are honoured."
+              continue
+            fi
+            if [ -z "$VC_VALUES" ]; then continue; fi
+            if ! VC_PATHS=$(git diff-tree --no-commit-id -r --name-only --root "$VC" --); then
+              VC_PATHS=""
+            fi
+            while IFS= read -r VV; do
+              VV="${VV%$'\r'}"
+              VV="${VV#"${VV%%[![:space:]]*}"}"
+              VV="${VV%"${VV##*[![:space:]]}"}"
+              if [ -z "$VV" ]; then continue; fi
+              # ^plugins/[A-Za-z0-9._-]+/$, spelled out without ranges so no
+              # locale can widen it; "." and ".." are refused as well.
+              VN=""
+              case "$VV" in
+                plugins/*/) VN="${VV#plugins/}"; VN="${VN%/}" ;;
+              esac
+              case "$VN" in
+                ""|.|..|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
+                  echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT rejected: it must name exactly one directory, as plugins/<dir>/. Still linting."
+                  continue
+                  ;;
+              esac
+              VN_LOWER=$(printf '%s' "$VN" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+              case "$VN_LOWER" in
+                fc-*|fw-*|firecrown-*|kserv*)
+                  echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT: first-party dir declared vendored; still linting."
+                  continue
+                  ;;
+              esac
+              if [ -z "$VC_PATHS" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: could not list the paths that commit changes. Still linting."
+                continue
+              fi
+              VC_OUTSIDE=""
+              while IFS= read -r VP; do
+                if [ -z "$VP" ]; then continue; fi
+                # git C-quotes unusual names ("plugins/x/\303\251.php"); a
+                # quoted path under $VV starts with a quote and then $VV.
+                case "$VP" in
+                  "$VV"*|"\"$VV"*) ;;
+                  *) VC_OUTSIDE="$VP"; break ;;
+                esac
+              done <<< "$VC_PATHS"
+              if [ -n "$VC_OUTSIDE" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: that commit also changes '$VC_OUTSIDE', outside $VV. Still linting."
+                continue
+              fi
+              VD_SEEN=""
+              for VD in "${VENDORED_DIRS[@]}"; do
+                if [ "$VD" = "$VV" ]; then VD_SEEN=1; fi
+              done
+              if [ -z "$VD_SEEN" ]; then VENDORED_DIRS+=("$VV"); fi
+            done <<< "$VC_VALUES"
+          done <<< "$VENDORED_COMMITS"
+          if [ "${#VENDORED_DIRS[@]}" -gt 0 ]; then
+            VENDORED_LIST=""
+            for VD in "${VENDORED_DIRS[@]}"; do
+              VENDORED_LIST="${VENDORED_LIST:+$VENDORED_LIST, }$VD"
+            done
+            if [ "$LINT_VENDORED_PLUGINS" = "true" ]; then
+              echo "::notice::lint_vendored_plugins is true, so vendored plugin dir(s) are linted anyway: $VENDORED_LIST"
+            else
+              VENDORED_KEPT=""
+              VENDORED_SKIPPED=0
+              while IFS= read -r VF; do
+                if [ -z "$VF" ]; then continue; fi
+                VF_DROP=""
+                for VD in "${VENDORED_DIRS[@]}"; do
+                  case "$VF" in
+                    "$VD"*|"\"$VD"*) VF_DROP=1 ;;
+                  esac
+                done
+                if [ -n "$VF_DROP" ]; then
+                  VENDORED_SKIPPED=$((VENDORED_SKIPPED + 1))
+                else
+                  VENDORED_KEPT="${VENDORED_KEPT}${VF}${NL}"
+                fi
+              done <<< "$FILES"
+              FILES="${VENDORED_KEPT%"$NL"}"
+              echo "::notice::Skipped $VENDORED_SKIPPED file(s) in vendored plugin dir(s): $VENDORED_LIST"
+            fi
+          fi
+
           if [ -z "$FILES" ]; then
             echo "No PHP or JS files changed — skipping PHPCS."
             exit 0
