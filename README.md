@@ -123,12 +123,41 @@ trailer is honoured only when:
 - it is on a **non-merge** commit in the range (`origin/<base>..HEAD` on a pull request,
   `<before>..<sha>` on a push);
 - it names **exactly one** directory level, matching `^plugins/[A-Za-z0-9._-]+/$`;
+- the directory is **not first-party by name**: `plugins/fc-*`, `plugins/fw-*`,
+  `plugins/firecrown-*` and `plugins/kserv*` are always linted, with a `::warning::`;
 - **every** path that commit changes is inside that directory;
-- the directory is **not first-party**: `plugins/fc-*`, `plugins/fw-*`, `plugins/firecrown-*` and
-  `plugins/kserv*` are always linted, with a `::warning::`.
+- the directory **does not exist on the scan base** (`origin/<base>`, or `<before>`). The skip is
+  for **new installs only**, so a trailer can never exempt code that is already in the repo, whatever
+  its name. In-house plugins such as `astronomy-core`, `nexus-analytics`, `bonnier-*`, `wp-omeda` or
+  `tcc-*` carry none of the first-party prefixes, and this rule is what keeps them linted;
+- that commit **creates** the directory, so it is absent from the commit's parent;
+- at the scanned endpoint the directory is **exactly the tree that commit wrote**. If any other
+  change in the range touches it, the whole directory is linted. That covers a trailer-less
+  patch, a `git mv` into it, a merge that edits it, and a mode change.
 
-Once a directory is accepted, every changed file under it is skipped for that run, including
-files that other commits in the same range change there. A rejected trailer is reported as a
-`::warning::` with the reason, and its files are linted. Skipped files are counted in a
-`::notice::`. On a push whose `before` is all zeros (a new branch), no trailer is honoured. Set
-`lint_vendored_plugins: true` in a caller to lint vendored directories anyway.
+Together these mean every skipped file holds exactly the bytes the trailer commit added. No
+commit, other than the one carrying the trailer, can get a file skipped. A rejected trailer is
+reported as a `::warning::` with the reason, and the files under its directory are linted. Skipped
+files are counted in a `::notice::`. Set `lint_vendored_plugins: true` in a caller to lint vendored
+directories anyway.
+
+Known limits:
+
+- The skip cannot tell in-house code from third-party code by content. A **new** directory whose
+  own creating commit carries the trailer is skipped whatever it holds. The trailer is a
+  declaration, reviewed in the PR like the rest of the commit.
+- Updating a plugin that is already installed is **not** covered: the directory exists on the
+  base, so the whole update is linted. Extending the skip to updates is a separate decision
+  (wpvip-fleet ADR-024 covers installs only).
+
+**No diff base.** A delta scan with nothing to compare no longer reports "No PHP or JS files
+changed":
+
+- On a push or `workflow_dispatch` whose `before` is empty or all zeros (a manual run, or the
+  first push of a branch), it prints a `::warning::` saying no file is linted, and exits 0 as
+  before. Use `scan_mode: full` for a whole-repo scan.
+- On a push whose `before` is not in the clone (the branch's history was rewritten), it fails
+  with `::error::`.
+- On a pull request whose base does not resolve, it fails with `::error::`.
+
+So a green delta scan always means the delta was actually computed.

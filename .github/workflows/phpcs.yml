@@ -115,11 +115,41 @@ jobs:
           PHPCS_SHA: ${{ github.sha }}
           LINT_VENDORED_PLUGINS: ${{ inputs.lint_vendored_plugins }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES=$(git diff --name-only --diff-filter=ACMRT "origin/${{ github.base_ref }}...HEAD" | grep -E '\.(php|js)$' || true)
+          # A delta scan needs a diff base. Without one there is nothing to
+          # compare, and "No PHP or JS files changed" would claim a scan that
+          # never happened.
+          #   - pull_request: the base always exists (fetch-depth: 0), and a
+          #     green result is used as evidence (wpvip-fleet ADR-024, gate
+          #     G5i), so a base that will not resolve is an error.
+          #   - push / workflow_dispatch with an empty or all-zeros `before`:
+          #     no base exists by design (a manual run, or the first push of a
+          #     branch). Warn, lint nothing, and exit 0 as before.
+          #   - a non-zero `before` missing from this full clone: the branch's
+          #     history was rewritten. An error.
+          if [ "$PHPCS_EVENT_NAME" = "pull_request" ]; then
+            SCAN_BASE="origin/${PHPCS_BASE_REF}"
+            SCAN_HEAD="HEAD"
+            DIFF_RANGE=("${SCAN_BASE}...${SCAN_HEAD}")
           else
-            FILES=$(git diff --name-only --diff-filter=ACMRT "${{ github.event.before }}" "${{ github.sha }}" | grep -E '\.(php|js)$' || true)
+            SCAN_BASE="$PHPCS_BEFORE"
+            SCAN_HEAD="$PHPCS_SHA"
+            DIFF_RANGE=("$SCAN_BASE" "$SCAN_HEAD")
+            if [ -z "${PHPCS_BEFORE//0/}" ]; then
+              echo "::warning::No diff base: event.before is empty or all zeros ($PHPCS_EVENT_NAME: a manual run, or the first push of a branch), so the delta scan lints no file. Use scan_mode: full to scan the repository."
+              exit 0
+            fi
           fi
+          for SCAN_REV in "$SCAN_BASE" "$SCAN_HEAD"; do
+            if ! git rev-parse --verify -q "${SCAN_REV}^{commit}" > /dev/null; then
+              echo "::error::The delta scan cannot resolve '$SCAN_REV' to a commit in this clone, so it lints no file. On a push, the branch's history was probably rewritten."
+              exit 1
+            fi
+          done
+          if ! CHANGED=$(git diff --name-only --diff-filter=ACMRT "${DIFF_RANGE[@]}" --); then
+            echo "::error::git diff ${DIFF_RANGE[*]} failed, so the delta scan lints no file."
+            exit 1
+          fi
+          FILES=$(printf '%s\n' "$CHANGED" | grep -E '\.(php|js)$' || true)
 
           # PHPCS_VENDORED_SKIP v1 — wpvip-fleet ADR-024
           #
@@ -133,34 +163,39 @@ jobs:
           # A trailer is honoured only when ALL of these hold:
           #   - it is on a non-merge commit inside the scan range;
           #   - it names exactly one directory level, ^plugins/[A-Za-z0-9._-]+/$;
+          #   - the directory is not first-party by name (fc-, fw-, firecrown-,
+          #     kserv): those are always linted, with a warning;
           #   - every path that commit changes is inside that directory, so a
-          #     trailer cannot vouch for anything else in the same commit;
-          #   - the directory is not first-party (fc-, fw-, firecrown-, kserv):
-          #     those are always linted, with a warning.
-          # Any other trailer is rejected with a warning and its files are linted.
-          # Once a dir is accepted, every changed file under it is skipped for
-          # this run, whichever commit in the range changed it.
-          # Callers set lint_vendored_plugins: true to lint vendored dirs anyway.
+          #     trailer cannot vouch for anything else in its own commit;
+          #   - the directory does not exist on the scan base. The skip is for
+          #     new installs only, so no trailer can exempt code that is already
+          #     there, whatever it is called (astronomy-core, nexus-analytics, ...);
+          #   - that commit creates the directory (it is absent from the
+          #     commit's parent), so nothing an earlier commit put there rides
+          #     along;
+          #   - at the scanned endpoint the directory is exactly the tree that
+          #     commit wrote, so no other commit in the range changed it: not a
+          #     trailer-less patch, not a `git mv` into it, not a merge.
+          # Together these mean every skipped file holds exactly the bytes the
+          # trailer commit added. Any other trailer is rejected with a warning,
+          # and the files under its directory are linted. Callers set
+          # lint_vendored_plugins: true to lint vendored dirs anyway.
+          #
+          # What it cannot do is tell in-house code from third-party code by
+          # content. A new directory whose own creating commit carries the
+          # trailer is skipped whatever it holds: the trailer is a declaration,
+          # reviewed in the PR like the rest of the commit.
           #
           # Written for `bash -e` with or without pipefail: no pipeline's status
           # is relied on, every git call that can fail is inside an `if`, and a
           # path is one line, so names with spaces survive.
           NL=$'\n'
           VENDORED_DIRS=()
-          VENDORED_RANGE=""
-          if [ "$PHPCS_EVENT_NAME" = "pull_request" ]; then
-            VENDORED_RANGE="origin/${PHPCS_BASE_REF}..HEAD"
-          elif [ -z "${PHPCS_BEFORE//0/}" ]; then
-            echo "::notice::event.before is empty or all zeros (a new branch push), so Plugin-Vendored trailers are not honoured; linting every changed file."
-          else
-            VENDORED_RANGE="${PHPCS_BEFORE}..${PHPCS_SHA}"
-          fi
-          VENDORED_COMMITS=""
-          if [ -n "$VENDORED_RANGE" ]; then
-            if ! VENDORED_COMMITS=$(git rev-list --no-merges "$VENDORED_RANGE" --); then
-              echo "::warning::Could not list the commits in $VENDORED_RANGE, so Plugin-Vendored trailers are not honoured; linting every changed file."
-              VENDORED_COMMITS=""
-            fi
+          # Both ends are verified commits by now, so FILES is the real delta.
+          VENDORED_RANGE="${SCAN_BASE}..${SCAN_HEAD}"
+          if ! VENDORED_COMMITS=$(git rev-list --no-merges "$VENDORED_RANGE" --); then
+            echo "::warning::Could not list the commits in $VENDORED_RANGE, so no Plugin-Vendored trailer is honoured and every changed file is linted."
+            VENDORED_COMMITS=""
           fi
           while IFS= read -r VC; do
             if [ -z "$VC" ]; then continue; fi
@@ -213,6 +248,42 @@ jobs:
               done <<< "$VC_PATHS"
               if [ -n "$VC_OUTSIDE" ]; then
                 echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: that commit also changes '$VC_OUTSIDE', outside $VV. Still linting."
+                continue
+              fi
+              VDIR="${VV%/}"
+              # New installs only: absent on the scan base. ls-tree prints
+              # nothing for an absent path and fails only on a real error, so
+              # both "exists" and "could not tell" keep the files linted.
+              if ! VDIR_ON_BASE=$(git ls-tree --full-tree "$SCAN_BASE" -- "$VDIR"); then
+                VDIR_ON_BASE="unreadable"
+              fi
+              if [ -n "$VDIR_ON_BASE" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VV already exists on $SCAN_BASE, and the skip covers new installs only. Still linting."
+                continue
+              fi
+              # The trailer commit creates it: absent from its parent. A root
+              # commit has none; a non-merge commit has at most one.
+              if ! VC_PARENTS=$(git log -1 --format=%P "$VC" --); then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: could not read that commit's parent. Still linting."
+                continue
+              fi
+              VDIR_BEFORE=""
+              for VPARENT in $VC_PARENTS; do
+                if ! VDIR_ON_PARENT=$(git ls-tree --full-tree "$VPARENT" -- "$VDIR"); then
+                  VDIR_ON_PARENT="unreadable"
+                fi
+                if [ -n "$VDIR_ON_PARENT" ]; then VDIR_BEFORE=1; fi
+              done
+              if [ -n "$VDIR_BEFORE" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VV already exists before that commit, and the trailer must be on the commit that creates it. Still linting."
+                continue
+              fi
+              # Nothing else changed it: at the endpoint it is the very tree the
+              # trailer commit wrote.
+              if ! VDIR_OWN=$(git rev-parse --verify -q "${VC}:${VDIR}"); then VDIR_OWN=""; fi
+              if ! VDIR_END=$(git rev-parse --verify -q "${SCAN_HEAD}:${VDIR}"); then VDIR_END=""; fi
+              if [ -z "$VDIR_OWN" ] || [ "$VDIR_OWN" != "$VDIR_END" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VV at $SCAN_HEAD is not the tree that commit wrote, so another change in the range touches it. Still linting."
                 continue
               fi
               VD_SEEN=""
