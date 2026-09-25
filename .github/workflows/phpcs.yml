@@ -126,8 +126,12 @@ jobs:
           #     branch). Warn, lint nothing, and exit 0 as before.
           #   - a non-zero `before` missing from this full clone: the branch's
           #     history was rewritten. An error.
+          # The PR base is spelled as the full remote-tracking ref. A short
+          # "origin/<base>" resolves refs/tags/ first, checkout fetches every
+          # tag, and a pushed tag named origin/develop would silently become
+          # the base: the delta, the range and the "absent on base" test.
           if [ "$PHPCS_EVENT_NAME" = "pull_request" ]; then
-            SCAN_BASE="origin/${PHPCS_BASE_REF}"
+            SCAN_BASE="refs/remotes/origin/${PHPCS_BASE_REF}"
             SCAN_HEAD="HEAD"
             DIFF_RANGE=("${SCAN_BASE}...${SCAN_HEAD}")
           else
