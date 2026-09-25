@@ -159,6 +159,11 @@ which first-party code never is. A premium or other non-wordpress.org update, a 
 normalises line endings on commit, and a locally patched plugin are all linted, and a red check
 holds them for a human. The comparison runs in `python3` (shipped on `ubuntu-latest`), which parses
 the JSON, lists the tree NUL-delimited and hashes every blob through one `git cat-file --batch`.
+The step *Stage the vendored-update checksum verifier* writes it to `$RUNNER_TEMP`, directly
+before the delta scan. It is a separate step because the delta scan's script contains a GitHub
+expression, and GitHub then compiles the whole script into one expression, capped at 21,000
+characters with braces and quotes doubled. Inline, the verifier pushed it over the cap and GitHub
+refused the workflow. Keep that script under the cap.
 
 Together the two rules mean no commit other than the one carrying the trailer can get a file
 skipped. A rejected trailer is reported as a `::warning::` with the reason, and the files under
