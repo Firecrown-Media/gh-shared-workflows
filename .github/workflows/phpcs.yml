@@ -149,11 +149,25 @@ jobs:
               exit 1
             fi
           done
-          if ! CHANGED=$(git diff --name-only --diff-filter=ACMRT "${DIFF_RANGE[@]}" --); then
+          # core.quotePath=false prints non-ASCII names as they are. Quoted,
+          # they end in '"', never match the filter below, and go unlinted.
+          # The raw bytes need `LC_ALL=C grep -a`: in a UTF-8 locale, GNU grep
+          # calls a name that is not valid UTF-8 binary and stops printing
+          # matches from there on, which would drop every later file.
+          if ! CHANGED=$(git -c core.quotePath=false diff --name-only --diff-filter=ACMRT "${DIFF_RANGE[@]}" --); then
             echo "::error::git diff ${DIFF_RANGE[*]} failed, so the delta scan lints no file."
             exit 1
           fi
-          FILES=$(printf '%s\n' "$CHANGED" | grep -E '\.(php|js)$' || true)
+          # git still quotes a name holding '"', '\' or a control character,
+          # and phpcs trims a leading space off a listed name, so neither can
+          # be handed to phpcs as itself. Fail instead of passing unlinted.
+          UNLINTABLE=$(printf '%s\n' "$CHANGED" | LC_ALL=C grep -a -E '^(".*\.(php|js)"| .*\.(php|js))$' || true)
+          if [ -n "$UNLINTABLE" ]; then
+            echo "::error::The delta scan cannot pass these changed file(s) to phpcs by name (a double quote, backslash or control character, or a leading space), so it would not lint them. Rename them:"
+            printf '%s\n' "$UNLINTABLE"
+            exit 1
+          fi
+          FILES=$(printf '%s\n' "$CHANGED" | LC_ALL=C grep -a -E '\.(php|js)$' || true)
 
           # PHPCS_VENDORED_SKIP v1 — wpvip-fleet ADR-024
           #
@@ -335,7 +349,16 @@ jobs:
           echo "$FILES"
           # -q suppresses phpcs's progress output ('. 1 / 1 (100%)') so cs2pr
           # sees only the XML report on stdin.
-          echo "$FILES" | xargs vendor/bin/phpcs -q ${{ steps.standard.outputs.args }} --report=checkstyle | cs2pr
+          #
+          # The paths reach phpcs as a file, one per line, never as arguments.
+          # Through xargs a changed file named like an option (--ignore=*.php)
+          # was parsed as one, a space split a name in two, a quote aborted the
+          # batch, and past xargs' buffer (128 KiB of paths on the runner)
+          # phpcs ran twice, so cs2pr got two XML documents and failed with
+          # no annotations, clean delta or not. One run writes one report.
+          PHPCS_LIST=$(mktemp)
+          printf '%s\n' "$FILES" > "$PHPCS_LIST"
+          vendor/bin/phpcs -q ${{ steps.standard.outputs.args }} --report=checkstyle --file-list="$PHPCS_LIST" | cs2pr
 
       # Full mode takes its PATHS from the ruleset, not from the command line, so
       # without one phpcs walks the entire checkout — vendor/, node_modules/ and
