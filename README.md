@@ -83,7 +83,7 @@ jobs:
 
 The following workflows predate the Terraform migration and are used by WordPress repos (e.g., `astronomy`):
 
-- `phpcs.yml` — PHP CodeSniffer linting (see below; delta mode skips vendored third-party plugin directories)
+- `phpcs.yml` — PHP CodeSniffer linting (see below; delta mode skips vendored third-party plugin installs, and updates that match a wordpress.org release)
 - `security-scan.yml` — security scanning
 - `ai-issue-agent.yml` — AI-assisted issue triage
 - `vip-sync.yml` — WordPress VIP sync
@@ -108,17 +108,18 @@ with no ruleset file falls back to `--standard=WordPress-VIP-Go`. The job is ski
 (`COMPOSER_APP_ID` / `COMPOSER_APP_PRIVATE_KEY`) for private Composer packages. Without them those
 steps skip.
 
-**Vendored-plugin skip (`PHPCS_VENDORED_SKIP`, wpvip-fleet ADR-024).** Installing a third-party
-plugin into `plugins/<dir>/` would otherwise lint every file of someone else's code and turn the
-PR red. In `delta` mode, the files under `plugins/<dir>/` are dropped from the scan when a commit
-in the scan range carries the trailer
+**Vendored-plugin skip (`PHPCS_VENDORED_SKIP` v2, wpvip-fleet ADR-024 and ADR-025).** Installing
+or updating a third-party plugin in `plugins/<dir>/` would otherwise lint every file of someone
+else's code and turn the PR red. In `delta` mode, the files under `plugins/<dir>/` are dropped from
+the scan when a commit in the scan range carries the trailer
 
 ```
 Plugin-Vendored: plugins/<dir>/
+Plugin-Upstream: wporg:<slug>@<version>     <- updates only
 ```
 
-`garage/scripts/plugin-rollout.py` (in `wpvip-fleet`) writes it on the commits it builds. The
-trailer is honoured only when:
+`garage/scripts/plugin-rollout.py` (in `wpvip-fleet`) writes these on the commits it builds.
+Every `Plugin-Vendored` trailer must first pass all of these:
 
 - it is on a **non-merge** commit in the range (`refs/remotes/origin/<base>..HEAD` on a pull
   request, `<before>..<sha>` on a push);
@@ -126,30 +127,53 @@ trailer is honoured only when:
 - the directory is **not first-party by name**: `plugins/fc-*`, `plugins/fw-*`,
   `plugins/firecrown-*` and `plugins/kserv*` are always linted, with a `::warning::`;
 - **every** path that commit changes is inside that directory;
-- the directory **does not exist on the scan base** (`refs/remotes/origin/<base>`, or
-  `<before>`). The skip is for **new installs only**, so a trailer can never exempt code that is
-  already in the repo, whatever its name. In-house plugins such as `astronomy-core`,
-  `nexus-analytics`, `bonnier-*`, `wp-omeda` or `tcc-*` carry none of the first-party prefixes,
-  and this rule is what keeps them linted;
-- that commit **creates** the directory, so it is absent from the commit's parent;
 - at the scanned endpoint the directory is **exactly the tree that commit wrote**. If any other
   change in the range touches it, the whole directory is linted. That covers a trailer-less
   patch, a `git mv` into it, a merge that edits it, and a mode change.
 
-Together these mean every skipped file holds exactly the bytes the trailer commit added. No
-commit, other than the one carrying the trailer, can get a file skipped. A rejected trailer is
-reported as a `::warning::` with the reason, and the files under its directory are linted. Skipped
-files are counted in a `::notice::`. Set `lint_vendored_plugins: true` in a caller to lint vendored
-directories anyway.
+Then one of two rules decides, depending on whether the directory is new.
+
+**Install (a new directory; the v1 rule, unchanged).** The directory **does not exist on the scan
+base** (`refs/remotes/origin/<base>`, or `<before>`), and that commit **creates** it, so it is
+absent from the commit's parent. Every skipped file holds exactly the bytes the trailer commit
+added.
+
+**Update (an existing directory).** The directory exists on the scan base or in the commit's
+parent. Being there already says nothing about what it is: in-house plugins such as
+`astronomy-core`, `nexus-analytics`, `bonnier-*`, `wp-omeda` or `tcc-*` carry none of the
+first-party prefixes. So the bytes have to prove it, and the trailer is honoured only when **all**
+of these also hold:
+
+- the commit carries **exactly one** `Plugin-Upstream: wporg:<slug>@<version>` trailer. `<slug>`
+  must be the directory name, case included, and `<version>` must match `^[0-9A-Za-z._-]+$`;
+- `curl -fsS --max-time 20
+  https://downloads.wordpress.org/plugin-checksums/<slug>/<version>.json` succeeds, and the
+  response is the checksums of that slug and version;
+- the directory's files at the scanned endpoint are **exactly** the files that release lists, no
+  more and no fewer, and each is a regular file (a symlink or submodule is refused);
+- **every** file's sha256 matches the release. wordpress.org gives a string, or a list when the
+  tag was re-cut, and any member of a list matches.
+
+So every skipped file of an update is, byte for byte, a file of a published wordpress.org release,
+which first-party code never is. A premium or other non-wordpress.org update, a site that
+normalises line endings on commit, and a locally patched plugin are all linted, and a red check
+holds them for a human. The comparison runs in `python3` (shipped on `ubuntu-latest`), which parses
+the JSON, lists the tree NUL-delimited and hashes every blob through one `git cat-file --batch`.
+
+Together the two rules mean no commit other than the one carrying the trailer can get a file
+skipped. A rejected trailer is reported as a `::warning::` with the reason, and the files under
+its directory are linted. So is a `Plugin-Upstream` trailer with no `Plugin-Vendored` beside it.
+Each verified update gets a `::notice::` giving its file count, and skipped files are counted in a
+`::notice::`. Set `lint_vendored_plugins: true` in a caller to lint vendored directories anyway.
 
 Known limits:
 
 - The skip cannot tell in-house code from third-party code by content. A **new** directory whose
-  own creating commit carries the trailer is skipped whatever it holds. The trailer is a
-  declaration, reviewed in the PR like the rest of the commit.
-- Updating a plugin that is already installed is **not** covered: the directory exists on the
-  base, so the whole update is linted. Extending the skip to updates is a separate decision
-  (wpvip-fleet ADR-024 covers installs only).
+  own creating commit carries the trailer is skipped whatever it holds, and an existing one is
+  skipped when it holds exactly some wordpress.org release of the slug it is named after. The
+  trailers are a declaration, reviewed in the PR like the rest of the commit.
+- An update needs wordpress.org to answer. If it cannot be reached, the update is linted and the
+  run goes red. Re-running the job is the recovery.
 
 **The diff base.** On a pull request the base is the full remote-tracking ref,
 `refs/remotes/origin/<base>`. A short `origin/<base>` would resolve a tag of that name first, and
