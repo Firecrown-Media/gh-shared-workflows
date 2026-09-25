@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: 'delta'
+      lint_vendored_plugins:
+        description: "Lint plugins/<dir>/ trees that a commit in the delta range declares third-party with a 'Plugin-Vendored: plugins/<dir>/' trailer (wpvip-fleet ADR-024). Default false: those files are skipped, with a notice."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   phpcs:
@@ -103,12 +108,238 @@ jobs:
 
       - name: Run PHPCS delta scan
         if: inputs.scan_mode == 'delta'
+        env:
+          PHPCS_EVENT_NAME: ${{ github.event_name }}
+          PHPCS_BASE_REF: ${{ github.base_ref }}
+          PHPCS_BEFORE: ${{ github.event.before }}
+          PHPCS_SHA: ${{ github.sha }}
+          LINT_VENDORED_PLUGINS: ${{ inputs.lint_vendored_plugins }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES=$(git diff --name-only --diff-filter=ACMRT "origin/${{ github.base_ref }}...HEAD" | grep -E '\.(php|js)$' || true)
+          # A delta scan needs a diff base. Without one there is nothing to
+          # compare, and "No PHP or JS files changed" would claim a scan that
+          # never happened.
+          #   - pull_request: the base always exists (fetch-depth: 0), and a
+          #     green result is used as evidence (wpvip-fleet ADR-024, gate
+          #     G5i), so a base that will not resolve is an error.
+          #   - push / workflow_dispatch with an empty or all-zeros `before`:
+          #     no base exists by design (a manual run, or the first push of a
+          #     branch). Warn, lint nothing, and exit 0 as before.
+          #   - a non-zero `before` missing from this full clone: the branch's
+          #     history was rewritten. An error.
+          # The PR base is spelled as the full remote-tracking ref. A short
+          # "origin/<base>" resolves refs/tags/ first, checkout fetches every
+          # tag, and a pushed tag named origin/develop would silently become
+          # the base: the delta, the range and the "absent on base" test.
+          if [ "$PHPCS_EVENT_NAME" = "pull_request" ]; then
+            SCAN_BASE="refs/remotes/origin/${PHPCS_BASE_REF}"
+            SCAN_HEAD="HEAD"
+            DIFF_RANGE=("${SCAN_BASE}...${SCAN_HEAD}")
           else
-            FILES=$(git diff --name-only --diff-filter=ACMRT "${{ github.event.before }}" "${{ github.sha }}" | grep -E '\.(php|js)$' || true)
+            SCAN_BASE="$PHPCS_BEFORE"
+            SCAN_HEAD="$PHPCS_SHA"
+            DIFF_RANGE=("$SCAN_BASE" "$SCAN_HEAD")
+            if [ -z "${PHPCS_BEFORE//0/}" ]; then
+              echo "::warning::No diff base: event.before is empty or all zeros ($PHPCS_EVENT_NAME: a manual run, or the first push of a branch), so the delta scan lints no file. Use scan_mode: full to scan the repository."
+              exit 0
+            fi
           fi
+          for SCAN_REV in "$SCAN_BASE" "$SCAN_HEAD"; do
+            if ! git rev-parse --verify -q "${SCAN_REV}^{commit}" > /dev/null; then
+              echo "::error::The delta scan cannot resolve '$SCAN_REV' to a commit in this clone, so it lints no file. On a push, the branch's history was probably rewritten."
+              exit 1
+            fi
+          done
+          # core.quotePath=false prints non-ASCII names as they are. Quoted,
+          # they end in '"', never match the filter below, and go unlinted.
+          # The raw bytes need `LC_ALL=C grep -a`: in a UTF-8 locale, GNU grep
+          # calls a name that is not valid UTF-8 binary and stops printing
+          # matches from there on, which would drop every later file.
+          if ! CHANGED=$(git -c core.quotePath=false diff --name-only --diff-filter=ACMRT "${DIFF_RANGE[@]}" --); then
+            echo "::error::git diff ${DIFF_RANGE[*]} failed, so the delta scan lints no file."
+            exit 1
+          fi
+          # git still quotes a name holding '"', '\' or a control character,
+          # and phpcs trims a leading space off a listed name, so neither can
+          # be handed to phpcs as itself. Fail instead of passing unlinted.
+          UNLINTABLE=$(printf '%s\n' "$CHANGED" | LC_ALL=C grep -a -E '^(".*\.(php|js)"| .*\.(php|js))$' || true)
+          if [ -n "$UNLINTABLE" ]; then
+            echo "::error::The delta scan cannot pass these changed file(s) to phpcs by name (a double quote, backslash or control character, or a leading space), so it would not lint them. Rename them:"
+            printf '%s\n' "$UNLINTABLE"
+            exit 1
+          fi
+          FILES=$(printf '%s\n' "$CHANGED" | LC_ALL=C grep -a -E '\.(php|js)$' || true)
+
+          # PHPCS_VENDORED_SKIP v1 — wpvip-fleet ADR-024
+          #
+          # A third-party plugin committed into plugins/<dir>/ is not ours to
+          # lint, and without this the delta scan sniffs every file of it, so the
+          # PR that installs it goes red on a caller that is otherwise green.
+          # garage/scripts/plugin-rollout.py marks such a commit with a trailer:
+          #
+          #   Plugin-Vendored: plugins/<dir>/
+          #
+          # A trailer is honoured only when ALL of these hold:
+          #   - it is on a non-merge commit inside the scan range;
+          #   - it names exactly one directory level, ^plugins/[A-Za-z0-9._-]+/$;
+          #   - the directory is not first-party by name (fc-, fw-, firecrown-,
+          #     kserv): those are always linted, with a warning;
+          #   - every path that commit changes is inside that directory, so a
+          #     trailer cannot vouch for anything else in its own commit;
+          #   - the directory does not exist on the scan base. The skip is for
+          #     new installs only, so no trailer can exempt code that is already
+          #     there, whatever it is called (astronomy-core, nexus-analytics, ...);
+          #   - that commit creates the directory (it is absent from the
+          #     commit's parent), so nothing an earlier commit put there rides
+          #     along;
+          #   - at the scanned endpoint the directory is exactly the tree that
+          #     commit wrote, so no other commit in the range changed it: not a
+          #     trailer-less patch, not a `git mv` into it, not a merge.
+          # Together these mean every skipped file holds exactly the bytes the
+          # trailer commit added. Any other trailer is rejected with a warning,
+          # and the files under its directory are linted. Callers set
+          # lint_vendored_plugins: true to lint vendored dirs anyway.
+          #
+          # What it cannot do is tell in-house code from third-party code by
+          # content. A new directory whose own creating commit carries the
+          # trailer is skipped whatever it holds: the trailer is a declaration,
+          # reviewed in the PR like the rest of the commit.
+          #
+          # Written for `bash -e` with or without pipefail: no pipeline's status
+          # is relied on, every git call that can fail is inside an `if`, and a
+          # path is one line, so names with spaces survive.
+          NL=$'\n'
+          VENDORED_DIRS=()
+          # Both ends are verified commits by now, so FILES is the real delta.
+          VENDORED_RANGE="${SCAN_BASE}..${SCAN_HEAD}"
+          if ! VENDORED_COMMITS=$(git rev-list --no-merges "$VENDORED_RANGE" --); then
+            echo "::warning::Could not list the commits in $VENDORED_RANGE, so no Plugin-Vendored trailer is honoured and every changed file is linted."
+            VENDORED_COMMITS=""
+          fi
+          while IFS= read -r VC; do
+            if [ -z "$VC" ]; then continue; fi
+            VC_SHORT="${VC:0:12}"
+            if ! VC_VALUES=$(git log -1 --format='%(trailers:key=Plugin-Vendored,valueonly,unfold)' "$VC" --); then
+              echo "::warning::Could not read the trailers of $VC_SHORT; none of them are honoured."
+              continue
+            fi
+            if [ -z "$VC_VALUES" ]; then continue; fi
+            if ! VC_PATHS=$(git diff-tree --no-commit-id -r --name-only --root "$VC" --); then
+              VC_PATHS=""
+            fi
+            while IFS= read -r VV; do
+              VV="${VV%$'\r'}"
+              VV="${VV#"${VV%%[![:space:]]*}"}"
+              VV="${VV%"${VV##*[![:space:]]}"}"
+              if [ -z "$VV" ]; then continue; fi
+              # ^plugins/[A-Za-z0-9._-]+/$, spelled out without ranges so no
+              # locale can widen it; "." and ".." are refused as well.
+              VN=""
+              case "$VV" in
+                plugins/*/) VN="${VV#plugins/}"; VN="${VN%/}" ;;
+              esac
+              case "$VN" in
+                ""|.|..|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
+                  echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT rejected: it must name exactly one directory, as plugins/<dir>/. Still linting."
+                  continue
+                  ;;
+              esac
+              VN_LOWER=$(printf '%s' "$VN" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+              case "$VN_LOWER" in
+                fc-*|fw-*|firecrown-*|kserv*)
+                  echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT: first-party dir declared vendored; still linting."
+                  continue
+                  ;;
+              esac
+              if [ -z "$VC_PATHS" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: could not list the paths that commit changes. Still linting."
+                continue
+              fi
+              VC_OUTSIDE=""
+              while IFS= read -r VP; do
+                if [ -z "$VP" ]; then continue; fi
+                # git C-quotes unusual names ("plugins/x/\303\251.php"); a
+                # quoted path under $VV starts with a quote and then $VV.
+                case "$VP" in
+                  "$VV"*|"\"$VV"*) ;;
+                  *) VC_OUTSIDE="$VP"; break ;;
+                esac
+              done <<< "$VC_PATHS"
+              if [ -n "$VC_OUTSIDE" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: that commit also changes '$VC_OUTSIDE', outside $VV. Still linting."
+                continue
+              fi
+              VDIR="${VV%/}"
+              # New installs only: absent on the scan base. ls-tree prints
+              # nothing for an absent path and fails only on a real error, so
+              # both "exists" and "could not tell" keep the files linted.
+              if ! VDIR_ON_BASE=$(git ls-tree --full-tree "$SCAN_BASE" -- "$VDIR"); then
+                VDIR_ON_BASE="unreadable"
+              fi
+              if [ -n "$VDIR_ON_BASE" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VV already exists on $SCAN_BASE, and the skip covers new installs only. Still linting."
+                continue
+              fi
+              # The trailer commit creates it: absent from its parent. A root
+              # commit has none; a non-merge commit has at most one.
+              if ! VC_PARENTS=$(git log -1 --format=%P "$VC" --); then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: could not read that commit's parent. Still linting."
+                continue
+              fi
+              VDIR_BEFORE=""
+              for VPARENT in $VC_PARENTS; do
+                if ! VDIR_ON_PARENT=$(git ls-tree --full-tree "$VPARENT" -- "$VDIR"); then
+                  VDIR_ON_PARENT="unreadable"
+                fi
+                if [ -n "$VDIR_ON_PARENT" ]; then VDIR_BEFORE=1; fi
+              done
+              if [ -n "$VDIR_BEFORE" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VV already exists before that commit, and the trailer must be on the commit that creates it. Still linting."
+                continue
+              fi
+              # Nothing else changed it: at the endpoint it is the very tree the
+              # trailer commit wrote.
+              if ! VDIR_OWN=$(git rev-parse --verify -q "${VC}:${VDIR}"); then VDIR_OWN=""; fi
+              if ! VDIR_END=$(git rev-parse --verify -q "${SCAN_HEAD}:${VDIR}"); then VDIR_END=""; fi
+              if [ -z "$VDIR_OWN" ] || [ "$VDIR_OWN" != "$VDIR_END" ]; then
+                echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VV at $SCAN_HEAD is not the tree that commit wrote, so another change in the range touches it. Still linting."
+                continue
+              fi
+              VD_SEEN=""
+              for VD in "${VENDORED_DIRS[@]}"; do
+                if [ "$VD" = "$VV" ]; then VD_SEEN=1; fi
+              done
+              if [ -z "$VD_SEEN" ]; then VENDORED_DIRS+=("$VV"); fi
+            done <<< "$VC_VALUES"
+          done <<< "$VENDORED_COMMITS"
+          if [ "${#VENDORED_DIRS[@]}" -gt 0 ]; then
+            VENDORED_LIST=""
+            for VD in "${VENDORED_DIRS[@]}"; do
+              VENDORED_LIST="${VENDORED_LIST:+$VENDORED_LIST, }$VD"
+            done
+            if [ "$LINT_VENDORED_PLUGINS" = "true" ]; then
+              echo "::notice::lint_vendored_plugins is true, so vendored plugin dir(s) are linted anyway: $VENDORED_LIST"
+            else
+              VENDORED_KEPT=""
+              VENDORED_SKIPPED=0
+              while IFS= read -r VF; do
+                if [ -z "$VF" ]; then continue; fi
+                VF_DROP=""
+                for VD in "${VENDORED_DIRS[@]}"; do
+                  case "$VF" in
+                    "$VD"*|"\"$VD"*) VF_DROP=1 ;;
+                  esac
+                done
+                if [ -n "$VF_DROP" ]; then
+                  VENDORED_SKIPPED=$((VENDORED_SKIPPED + 1))
+                else
+                  VENDORED_KEPT="${VENDORED_KEPT}${VF}${NL}"
+                fi
+              done <<< "$FILES"
+              FILES="${VENDORED_KEPT%"$NL"}"
+              echo "::notice::Skipped $VENDORED_SKIPPED file(s) in vendored plugin dir(s): $VENDORED_LIST"
+            fi
+          fi
+
           if [ -z "$FILES" ]; then
             echo "No PHP or JS files changed — skipping PHPCS."
             exit 0
@@ -118,7 +349,16 @@ jobs:
           echo "$FILES"
           # -q suppresses phpcs's progress output ('. 1 / 1 (100%)') so cs2pr
           # sees only the XML report on stdin.
-          echo "$FILES" | xargs vendor/bin/phpcs -q ${{ steps.standard.outputs.args }} --report=checkstyle | cs2pr
+          #
+          # The paths reach phpcs as a file, one per line, never as arguments.
+          # Through xargs a changed file named like an option (--ignore=*.php)
+          # was parsed as one, a space split a name in two, a quote aborted the
+          # batch, and past xargs' buffer (128 KiB of paths on the runner)
+          # phpcs ran twice, so cs2pr got two XML documents and failed with
+          # no annotations, clean delta or not. One run writes one report.
+          PHPCS_LIST=$(mktemp)
+          printf '%s\n' "$FILES" > "$PHPCS_LIST"
+          vendor/bin/phpcs -q ${{ steps.standard.outputs.args }} --report=checkstyle --file-list="$PHPCS_LIST" | cs2pr
 
       # Full mode takes its PATHS from the ruleset, not from the command line, so
       # without one phpcs walks the entire checkout — vendor/, node_modules/ and
