@@ -133,52 +133,74 @@ Every `Plugin-Vendored` trailer must first pass all of these:
 
 Then one of two rules decides, depending on whether the directory is new.
 
-**Install (a new directory; the v1 rule, unchanged).** The directory **does not exist on the scan
-base** (`refs/remotes/origin/<base>`, or `<before>`), and that commit **creates** it, so it is
-absent from the commit's parent. Every skipped file holds exactly the bytes the trailer commit
-added.
+**Install (a new directory; the v1 rule).** The directory **does not exist on the scan base**
+(`refs/remotes/origin/<base>`, or `<before>`), and that commit **creates** it, so it is absent
+from the commit's parent. Every skipped file holds exactly the bytes the trailer commit added.
+New in v2: a name that differs **only in case** from a directory on the scan base
+(`plugins/Astronomy-Core/` beside `plugins/astronomy-core/`) is not an install. The update rule
+decides it, so it is skipped only if its bytes are a wordpress.org release.
 
 **Update (an existing directory).** The directory exists on the scan base or in the commit's
-parent. Being there already says nothing about what it is: in-house plugins such as
+parent, or its name differs only in case from one on the scan base. Being there already says
+nothing about what it is: in-house plugins such as
 `astronomy-core`, `nexus-analytics`, `bonnier-*`, `wp-omeda` or `tcc-*` carry none of the
 first-party prefixes. So the bytes have to prove it, and the trailer is honoured only when **all**
 of these also hold:
 
 - the commit carries **exactly one** `Plugin-Upstream: wporg:<slug>@<version>` trailer. `<slug>`
   must be the directory name, case included, and `<version>` must match `^[0-9A-Za-z._-]+$`;
-- `curl -fsS --max-time 20
-  https://downloads.wordpress.org/plugin-checksums/<slug>/<version>.json` succeeds, and the
-  response is the checksums of that slug and version;
+- `curl -q -fsS --proto '=https' --max-redirs 0 --max-time 20 -w '%{http_code}'` fetches
+  `https://downloads.wordpress.org/plugin-checksums/<slug>/<version>.json` with **HTTP 200**, and
+  the response is the checksums of that slug and version. `-q` comes first, so no `~/.curlrc`
+  applies (an earlier step can write `HOME`). No redirect is followed, and a 3xx is refused
+  rather than having its body read as the checksums, which `-f` alone would allow;
 - the directory's files at the scanned endpoint are **exactly** the files that release lists, no
   more and no fewer, and each is a regular file (a symlink or submodule is refused);
 - **every** file's sha256 matches the release. wordpress.org gives a string, or a list when the
   tag was re-cut, and any member of a list matches.
 
-So every skipped file of an update is, byte for byte, a file of a published wordpress.org release,
-which first-party code never is. A premium or other non-wordpress.org update, a site that
-normalises line endings on commit, and a locally patched plugin are all linted, and a red check
-holds them for a human. The comparison runs in `python3` (shipped on `ubuntu-latest`), which parses
-the JSON, lists the tree NUL-delimited and hashes every blob through one `git cat-file --batch`.
+So every file the **update rule** skips is, byte for byte, a file of a published wordpress.org
+release. A premium or other non-wordpress.org update, a site that normalises line endings on
+commit, and a locally patched plugin are all linted, and a red check holds them for a human. The
+comparison runs in `python3` (shipped on `ubuntu-latest`), which parses the JSON, lists the tree
+NUL-delimited and hashes every blob through one `git cat-file --batch`, with a 300 s deadline.
 The step *Stage the vendored-update checksum verifier* writes it to `$RUNNER_TEMP`, directly
-before the delta scan. It is a separate step because the delta scan's script contains a GitHub
-expression, and GitHub then compiles the whole script into one expression, capped at 21,000
-characters with braces and quotes doubled. Inline, the verifier pushed it over the cap and GitHub
-refused the workflow. Keep that script under the cap.
+before the delta scan.
 
-Together the two rules mean no commit other than the one carrying the trailer can get a file
-skipped. A rejected trailer is reported as a `::warning::` with the reason, and the files under
-its directory are linted. So is a `Plugin-Upstream` trailer with no `Plugin-Vendored` beside it.
+**The delta scan's script holds no GitHub expression, and must not.** Every value, the standard
+args included, reaches it through `env:`. When a `run:` script contains an expression, GitHub
+compiles the whole script into one expression, capped at 21,000 characters with braces and quotes
+doubled, and past the cap it refuses the workflow on every caller: no jobs, "a workflow file
+issue". The first v2 probe hit exactly that (21,681), and actionlint does not check it.
+
+Under both rules a directory is skipped only as the trailer commit left it, so no other commit in
+the range can patch a skipped directory. Only the update rule checks what the bytes are; the
+install rule takes the trailer at its word (see *Known limits*). A rejected trailer is reported as
+a `::warning::` with the reason, and the files under its directory are linted. So is a
+`Plugin-Upstream` trailer with no `Plugin-Vendored` beside it.
 Each verified update gets a `::notice::` giving its file count, and skipped files are counted in a
 `::notice::`. Set `lint_vendored_plugins: true` in a caller to lint vendored directories anyway.
 
 Known limits:
 
 - The skip cannot tell in-house code from third-party code by content. A **new** directory whose
-  own creating commit carries the trailer is skipped whatever it holds, and an existing one is
-  skipped when it holds exactly some wordpress.org release of the slug it is named after. The
-  trailers are a declaration, reviewed in the PR like the rest of the commit.
+  own creating commit carries the trailer is skipped whatever it holds. That includes first-party
+  code moved there under a **new name**: `plugins/astronomy-core/` deleted by one commit and its
+  code re-added as `plugins/astro-core/` by the next is skipped, with no checksum. The only new
+  names this does not apply to are the first-party prefixes (always linted) and a name that
+  differs only in case from a directory on the scan base (decided by the update rule). An
+  existing directory is skipped when it holds exactly some wordpress.org
+  release of the slug it is named after. The trailers are a declaration, reviewed in the PR like
+  the rest of the commit.
 - An update needs wordpress.org to answer. If it cannot be reached, the update is linted and the
   run goes red. Re-running the job is the recovery.
+- **A green scan is only as trustworthy as the caller's `composer.json` and ruleset.** Code from
+  the commit under scan runs before the delta scan: `composer require` resolves the caller's own
+  `composer.json`, and a Composer plugin that file requires and allows could replace
+  `vendor/bin/phpcs` or rewrite the environment of every later step. A ruleset that excludes
+  paths narrows what is linted. The install step passes `--no-scripts`, so that file's `scripts`
+  do not run (no site defines any, and the standards installer is a plugin, which still runs).
+  Review of those two files is what closes the rest.
 
 **The diff base.** On a pull request the base is the full remote-tracking ref,
 `refs/remotes/origin/<base>`. A short `origin/<base>` would resolve a tag of that name first, and

@@ -77,12 +77,21 @@ jobs:
       - name: Trust the PHPCS standards installer
         run: composer config --no-plugins --global allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
 
+      # --no-scripts: `composer require` resolves the caller's own
+      # composer.json, and without the flag it runs that file's scripts
+      # (post-update-cmd, post-autoload-dump, ...), which is code from the
+      # commit under scan, able to rewrite HOME, $GITHUB_ENV or $GITHUB_PATH
+      # for every later step. No site's composer.json defines scripts. The
+      # standards installer is a Composer plugin, not a script, and still
+      # runs. What this does not close: a Composer plugin that the caller's
+      # composer.json requires and allows, and the caller's own ruleset. A
+      # green scan is only as trustworthy as those two files.
       - name: Install PHPCS and VIP ruleset
         run: |
           composer require --dev \
             automattic/vipwpcs:^3 \
             dealerdirect/phpcodesniffer-composer-installer \
-            --no-interaction --no-progress
+            --no-interaction --no-progress --no-scripts
 
       # A repo with no ruleset file gets phpcs's built-in default (PEAR), which on
       # WordPress code produces a flood of irrelevant findings. Naming the VIP
@@ -110,13 +119,15 @@ jobs:
       # delta scan). It prints one line, and exits 0 only on an exact match;
       # anything else, a crash included, keeps the files linted.
       #
-      # A step of its own because the delta scan's script holds a GitHub
-      # expression, so GitHub compiles all of that script into one expression,
-      # capped at 21,000 characters with its braces and quotes doubled. Inline,
-      # the verifier took it over and GitHub refused the workflow. Keep that
-      # script under the cap: code that needs no expression goes in a step
-      # like this one. It is written after Composer, directly before its only
-      # use, and outside the checkout, so no caller code runs in between.
+      # A step of its own since the first v2 probe: the delta scan's script
+      # then held a GitHub expression, so GitHub compiled all of it into one
+      # expression, capped at 21,000 characters with braces and quotes
+      # doubled, and the verifier took it over the cap. That script now holds
+      # no expression (see its env:), so the cap no longer applies to it.
+      # The verifier is written to $RUNNER_TEMP, outside the checkout, after
+      # Composer. That is not a trust boundary: code the caller's
+      # composer.json brings in can still change every later step (see the
+      # Install step).
       #
       # python3 (ubuntu-latest ships it) rather than jq (it ships that too),
       # because the work is more than parsing: compare a file set and a sha256
@@ -133,10 +144,13 @@ jobs:
           import json
           import subprocess
           import sys
+          import threading
 
 
+          # ASCII escapes, so two names that differ only in Unicode
+          # normalisation (NFC "caf\u00e9", NFD "cafe\u0301") print differently.
           def show(name):
-              text = json.dumps(name, ensure_ascii=False)
+              text = json.dumps(name, ensure_ascii=True)
               return text if len(text) <= 120 else text[:117] + '..."'
 
 
@@ -190,29 +204,56 @@ jobs:
               cat = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
               differ = []
-              try:
+
+              def hash_all():
                   for rel in sorted(blobs):
                       entry = files[rel]
                       want = entry.get("sha256") if isinstance(entry, dict) else None
                       if isinstance(want, str):
                           want = [want]
                       if not isinstance(want, list) or not want or not all(isinstance(w, str) for w in want):
-                          return "the release gives no sha256 for " + show(rel), 0
+                          return "the release gives no sha256 for " + show(rel)
                       cat.stdin.write(blobs[rel] + b"\n")
                       cat.stdin.flush()
                       header = cat.stdout.readline().split()
                       if len(header) != 3 or header[1] != b"blob":
-                          return "git cat-file could not read " + show(rel), 0
+                          return "git cat-file could not read " + show(rel)
                       size = int(header[2])
                       body = cat.stdout.read(size)
                       if len(body) != size or cat.stdout.read(1) != b"\n":
-                          return "git cat-file returned a short read for " + show(rel), 0
+                          return "git cat-file returned a short read for " + show(rel)
                       if hashlib.sha256(body).hexdigest() not in [w.lower() for w in want]:
                           differ.append(rel)
+                  return ""
+
+              # The same 300 s as ls-tree, so a wedged read cannot hold the
+              # job to GitHub's 6-hour limit. A killed git reads as EOF.
+              expired = threading.Event()
+
+              def expire():
+                  expired.set()
+                  cat.kill()
+
+              deadline = threading.Timer(300, expire)
+              deadline.daemon = True
+              deadline.start()
+              try:
+                  try:
+                      reason = hash_all()
+                  except OSError as e:
+                      reason = "git cat-file stopped answering (%s)" % type(e).__name__
               finally:
-                  cat.stdin.close()
-                  cat.stdout.close()
+                  deadline.cancel()
+                  for stream in (cat.stdin, cat.stdout):
+                      try:
+                          stream.close()
+                      except OSError:
+                          pass
                   cat.wait()
+              if reason:
+                  if expired.is_set():
+                      reason = "git cat-file did not finish within 300 s"
+                  return reason, 0
               if differ:
                   return ("%d file(s) differ from the release%s" % (len(differ), some(differ))), 0
               return "", len(blobs)
@@ -248,6 +289,13 @@ jobs:
           PHPCS_BEFORE: ${{ github.event.before }}
           PHPCS_SHA: ${{ github.sha }}
           LINT_VENDORED_PLUGINS: ${{ inputs.lint_vendored_plugins }}
+          PHPCS_STANDARD_ARGS: ${{ steps.standard.outputs.args }}
+        # Every value reaches this script through env:, and the script holds no
+        # GitHub expression. Keep it that way: one expression in a run: script
+        # makes GitHub compile the whole script into a single expression,
+        # capped at 21,000 characters with braces and quotes doubled, and past
+        # the cap it refuses the workflow on every caller (no jobs, "a workflow
+        # file issue"). actionlint does not check that.
         run: |
           # A delta scan needs a diff base. Without one there is nothing to
           # compare, and "No PHP or JS files changed" would claim a scan that
@@ -327,38 +375,46 @@ jobs:
           #
           # Then one of two rules decides.
           #
-          # Install (v1, unchanged): the directory does not exist on the scan
-          # base, and that commit creates it (it is absent from the commit's
-          # parent), so nothing an earlier commit put there rides along. Every
-          # skipped file holds exactly the bytes the trailer commit added.
+          # Install (v1): the directory does not exist on the scan base, and
+          # that commit creates it (it is absent from the commit's parent), so
+          # nothing an earlier commit put there rides along. Every skipped file
+          # holds exactly the bytes the trailer commit added. New in v2: a
+          # directory whose name differs only in case from one on the scan
+          # base (plugins/Astronomy-Core/ beside plugins/astronomy-core/) is
+          # not an install; the update rule decides it.
           #
           # Update (v2): the directory exists on the scan base or in the
-          # commit's parent. Being there already says nothing about what it is
+          # commit's parent, or differs only in case from one on the base.
+          # Being there already says nothing about what it is
           # (astronomy-core, nexus-analytics, ...), so the bytes have to prove
           # it. The trailer is honoured only when ALL of these also hold:
           #   - the commit carries exactly one Plugin-Upstream trailer,
           #     wporg:<slug>@<version>, whose <slug> is the directory name and
           #     whose <version> matches ^[0-9A-Za-z._-]+$;
           #   - wordpress.org serves checksums for that release,
-          #     downloads.wordpress.org/plugin-checksums/<slug>/<version>.json;
+          #     downloads.wordpress.org/plugin-checksums/<slug>/<version>.json,
+          #     with HTTP 200 over https and no redirect followed;
           #   - the directory's files at the endpoint are exactly the files that
           #     release lists, no more and no fewer, and all regular files;
           #   - every file's sha256 matches the release's (a string, or a list
           #     when the tag was re-cut, where any member matches).
-          # So every skipped file of an update is, byte for byte, a file of a
-          # published wordpress.org release, which first-party code never is.
-          # A premium or other non-wordpress.org update is linted.
+          # So every file the update rule skips is, byte for byte, a file of a
+          # published wordpress.org release. A premium or other
+          # non-wordpress.org update is linted.
           #
           # Any failure rejects the trailer with a warning naming the reason,
           # and the files under its directory are linted. A Plugin-Upstream
           # trailer without a Plugin-Vendored one vouches for nothing. Callers
           # set lint_vendored_plugins: true to lint vendored dirs anyway.
           #
-          # What neither rule can do is tell in-house code from third-party
-          # code by content. A new directory whose own creating commit carries
-          # the trailer is skipped whatever it holds, and an update is skipped
-          # when it is some wordpress.org release of that slug. A trailer is a
-          # declaration, reviewed in the PR like the rest of the commit.
+          # Only the update rule checks what the bytes are. The install rule
+          # takes the trailer at its word: a new directory whose own creating
+          # commit carries it is skipped whatever it holds, first-party code
+          # moved there under a new name included (plugins/astronomy-core/
+          # deleted by one commit, its code re-added as plugins/astro-core/ by
+          # the next). And an update is skipped when it is some wordpress.org
+          # release of that slug. A trailer is a declaration, reviewed in the
+          # PR like the rest of the commit.
           #
           # Written for `bash -e` with or without pipefail: no pipeline's status
           # is relied on, every call that can fail is inside an `if` or an `||`,
@@ -467,10 +523,26 @@ jobs:
                 echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VV at $SCAN_HEAD is not the tree that commit wrote, so another change in the range touches it. Still linting."
                 continue
               fi
-              if [ -n "$VDIR_ON_BASE" ] || [ -n "$VDIR_BEFORE" ]; then
+              # A new name that differs only in case from a directory on the
+              # base goes to the update rule. Compared ASCII-only (LC_ALL=C),
+              # as the name is ASCII.
+              VDIR_TWIN=""
+              if [ -z "$VDIR_ON_BASE" ] && [ -z "$VDIR_BEFORE" ]; then
+                if ! VDIR_SIBLINGS=$(git -c core.quotePath=false ls-tree --name-only --full-tree "$SCAN_BASE" -- plugins/); then
+                  echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: could not list plugins/ on $SCAN_BASE to rule out a directory whose name differs only in case. Still linting."
+                  continue
+                fi
+                VDIR_TWIN=$(printf '%s\n' "$VDIR_SIBLINGS" | LC_ALL=C grep -a -i -x -F -e "$VDIR" || true)
+                VDIR_TWIN="${VDIR_TWIN%%"$NL"*}"
+              fi
+              if [ -n "$VDIR_ON_BASE" ] || [ -n "$VDIR_BEFORE" ] || [ -n "$VDIR_TWIN" ]; then
                 # The update rule: the bytes must be a wordpress.org release.
                 VU_WHERE="already exists on $SCAN_BASE"
-                if [ -z "$VDIR_ON_BASE" ]; then VU_WHERE="already exists before that commit"; fi
+                if [ -n "$VDIR_TWIN" ]; then
+                  VU_WHERE="differs only in case from $VDIR_TWIN/ on $SCAN_BASE"
+                elif [ -z "$VDIR_ON_BASE" ]; then
+                  VU_WHERE="already exists before that commit"
+                fi
                 if ! VC_UPSTREAMS=$(git log -1 --format='%(trailers:key=Plugin-Upstream,valueonly,unfold)' "$VC" --); then
                   echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VV $VU_WHERE, so this is an update, and its Plugin-Upstream trailer could not be read. Still linting."
                   continue
@@ -520,9 +592,18 @@ jobs:
                   echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: no temporary file for the checksums. Still linting."
                   continue
                 fi
-                if ! curl -fsS --max-time 20 -o "$VU_JSON" "$VU_URL" < /dev/null; then
+                # -q first, so no ~/.curlrc (an earlier step can write HOME)
+                # adds -L or anything else; https only; no redirect followed.
+                # Only a 200 counts: -f fails on 4xx/5xx but passes a 3xx, and
+                # its body would land in the file as the checksums.
+                if ! VU_CODE=$(curl -q -fsS --proto '=https' --max-redirs 0 --max-time 20 -w '%{http_code}' -o "$VU_JSON" "$VU_URL" < /dev/null); then
                   rm -f "$VU_JSON"
                   echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VU_URL could not be fetched, so $VN $VU_VER is not a wordpress.org release this scan can verify. Still linting."
+                  continue
+                fi
+                if [ "$VU_CODE" != "200" ]; then
+                  rm -f "$VU_JSON"
+                  echo "::warning::Plugin-Vendored value '$VV' on $VC_SHORT not honoured: $VU_URL answered HTTP ${VU_CODE:-(no status)}, not 200, so $VN $VU_VER is not a wordpress.org release this scan can verify. Still linting."
                   continue
                 fi
                 if ! VU_RESULT=$(python3 "$VERIFY_PY" "$SCAN_HEAD" "$VDIR" "$VN" "$VU_VER" "$VU_JSON" < /dev/null); then
@@ -587,7 +668,9 @@ jobs:
           # no annotations, clean delta or not. One run writes one report.
           PHPCS_LIST=$(mktemp)
           printf '%s\n' "$FILES" > "$PHPCS_LIST"
-          vendor/bin/phpcs -q ${{ steps.standard.outputs.args }} --report=checkstyle --file-list="$PHPCS_LIST" | cs2pr
+          # PHPCS_STANDARD_ARGS is empty or one argument
+          # (--standard=WordPress-VIP-Go), passed as that one argument.
+          vendor/bin/phpcs -q ${PHPCS_STANDARD_ARGS:+"$PHPCS_STANDARD_ARGS"} --report=checkstyle --file-list="$PHPCS_LIST" | cs2pr
 
       # Full mode takes its PATHS from the ruleset, not from the command line, so
       # without one phpcs walks the entire checkout — vendor/, node_modules/ and
