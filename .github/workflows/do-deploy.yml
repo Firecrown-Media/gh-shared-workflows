@@ -61,15 +61,19 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
           cat > ~/.ssh/config <<CFG
           Host target
             HostName $HOST
             User deploy
             IdentityFile ~/.ssh/deploy_key
             IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+            ConnectTimeout 20
             ServerAliveInterval 30
           CFG
+          if ! ssh target true; then
+            echo "::error::cannot reach deploy@$HOST over SSH (firewall, key, or host down)"; exit 1
+          fi
 
       - name: Preflight on the droplet
         run: |
