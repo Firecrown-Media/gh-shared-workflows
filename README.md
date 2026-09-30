@@ -88,3 +88,31 @@ The following workflows predate the Terraform migration and are used by WordPres
 - `ai-issue-agent.yml` — AI-assisted issue triage
 - `vip-sync.yml` — WordPress VIP sync
 - `vip-reverse-sync.yml` — WordPress VIP reverse sync
+
+---
+
+### `do-deploy.yml` — Deploy to the DigitalOcean WordPress pool
+
+Rsyncs the repository to a new release directory on a pool droplet, links the shared uploads and `wp-config.php`, flips the `current` symlink, flushes the object cache and prunes old releases. Expects the site layout created by the pool's Ansible playbook (`/var/www/<site>/{releases,current,shared}`).
+
+**Inputs:** `site` (slug under /var/www), `environment` (`stage` or `production`), `host` (droplet), `url` (optional, smoke-tested after activation), `keep_releases` (default 5).
+
+**Secrets:** `DEPLOY_SSH_KEY` (private key for the droplet's `deploy` user).
+
+**Example caller:**
+
+```yaml
+on:
+  push:
+    branches: [stage, main]
+jobs:
+  deploy:
+    uses: Firecrown-Media/gh-shared-workflows/.github/workflows/do-deploy.yml@main
+    with:
+      site: media
+      environment: ${{ github.ref_name == 'main' && 'production' || 'stage' }}
+      host: ${{ github.ref_name == 'main' && vars.DO_PROD_HOST || vars.DO_STAGE_HOST }}
+      url: https://media.freightwaves.com
+    secrets:
+      DEPLOY_SSH_KEY: ${{ secrets.DO_DEPLOY_SSH_KEY }}
+```

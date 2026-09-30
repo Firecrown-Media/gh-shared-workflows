@@ -1,0 +1,117 @@
+name: Deploy to DigitalOcean WordPress pool
+
+# Reusable deploy for sites hosted on the DigitalOcean WordPress droplet pool
+# (release layout under /var/www/<site>: releases/<sha>, current symlink,
+# shared/uploads, shared/wp-config.php). Called from each site repo on push
+# to stage (stage droplet) and main (prod droplet).
+
+on:
+  workflow_call:
+    inputs:
+      site:
+        description: 'Site slug on the pool (directory under /var/www, PHP-FPM user wp-<site>)'
+        required: true
+        type: string
+      environment:
+        description: 'GitHub environment name (stage or production)'
+        required: true
+        type: string
+      host:
+        description: 'Droplet hostname or IP to deploy to'
+        required: true
+        type: string
+      url:
+        description: 'Public URL shown on the environment'
+        required: false
+        type: string
+        default: ''
+      keep_releases:
+        description: 'Number of releases to keep on the droplet'
+        required: false
+        type: number
+        default: 5
+    secrets:
+      DEPLOY_SSH_KEY:
+        description: 'Private key for the deploy user on the droplet'
+        required: true
+
+concurrency:
+  group: do-deploy-${{ inputs.site }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: ${{ inputs.site }} -> ${{ inputs.environment }} (${{ inputs.host }})
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.url }}
+    env:
+      SITE: ${{ inputs.site }}
+      HOST: ${{ inputs.host }}
+      ROOT: /var/www/${{ inputs.site }}
+      RELEASE: ${{ github.sha }}
+      KEEP: ${{ inputs.keep_releases }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<CFG
+          Host target
+            HostName $HOST
+            User deploy
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            ServerAliveInterval 30
+          CFG
+
+      - name: Preflight on the droplet
+        run: |
+          ssh target "test -d $ROOT/releases && test -d $ROOT/shared/uploads && test -f $ROOT/shared/wp-config.php" \
+            || { echo "::error::$ROOT is not a pool site layout (releases/, shared/uploads, shared/wp-config.php)"; exit 1; }
+
+      - name: Upload release
+        run: |
+          rsync -az --delete \
+            --exclude='.git/' --exclude='.github/' --exclude='.gitignore' --exclude='README.md' \
+            --exclude='wp-content/uploads/' --exclude='wp-content/cache/' --exclude='wp-config.php' \
+            --link-dest="$ROOT/current/" \
+            ./ "target:$ROOT/releases/$RELEASE/"
+
+      - name: Link shared files and activate
+        run: |
+          ssh target bash -s <<'REMOTE'
+          set -euo pipefail
+          SITE="${SITE}"; ROOT="${ROOT}"; REL="${ROOT}/releases/${RELEASE}"; KEEP="${KEEP}"
+          rm -rf "$REL/wp-content/uploads"
+          ln -sfn ../../../shared/uploads "$REL/wp-content/uploads"
+          cp "$ROOT/shared/wp-config.php" "$REL/wp-config.php"
+          chmod 640 "$REL/wp-config.php"
+          sudo -n chown -R "wp-${SITE}:wp-${SITE}" "$REL"
+          ln -sfn "releases/${RELEASE}" "$ROOT/current.tmp" && mv -Tf "$ROOT/current.tmp" "$ROOT/current"
+          sudo -n -u "wp-${SITE}" wp --path="$ROOT/current" core is-installed --skip-plugins --skip-themes >/dev/null
+          sudo -n -u "wp-${SITE}" wp --path="$ROOT/current" cache flush --skip-plugins --skip-themes >/dev/null 2>&1 || true
+          sudo -n systemctl reload "php8.3-fpm"
+          # prune old releases, keep the newest $KEEP
+          ls -1dt "$ROOT"/releases/*/ | tail -n +$((KEEP + 1)) | xargs -r rm -rf
+          echo "activated $REL"
+          REMOTE
+        env:
+          SITE: ${{ env.SITE }}
+          ROOT: ${{ env.ROOT }}
+          RELEASE: ${{ env.RELEASE }}
+          KEEP: ${{ env.KEEP }}
+
+      - name: Smoke test
+        if: inputs.url != ''
+        run: |
+          host=$(echo "${{ inputs.url }}" | sed -E 's#https?://##; s#/.*##')
+          code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve "$host:443:$HOST" -A 'Mozilla/5.0 (deploy smoke test)' "https://$host/")
+          echo "https://$host/ via $HOST -> $code"
+          case "$code" in 200|301|302) ;; *) echo "::error::unexpected status $code"; exit 1;; esac
