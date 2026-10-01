@@ -120,9 +120,10 @@ jobs:
           SITE="${SITE}"; ROOT="${ROOT}"; REL="${ROOT}/releases/${RELEASE}"; KEEP="${KEEP}"
           rm -rf "$REL/wp-content/uploads"
           ln -sfn ../../../shared/uploads "$REL/wp-content/uploads"
-          cp "$ROOT/shared/wp-config.php" "$REL/wp-config.php"
-          chmod 640 "$REL/wp-config.php"
+          # shared/wp-config.php is owned by the site's PHP user (mode 640), so copy it with sudo
+          sudo -n cp "$ROOT/shared/wp-config.php" "$REL/wp-config.php"
           sudo -n chown -R "wp-${SITE}:wp-${SITE}" "$REL"
+          sudo -n chmod 640 "$REL/wp-config.php"
           ln -sfn "releases/${RELEASE}" "$ROOT/current.tmp" && mv -Tf "$ROOT/current.tmp" "$ROOT/current"
           sudo -n -u "wp-${SITE}" wp --path="$ROOT/current" core is-installed --skip-plugins --skip-themes >/dev/null
           sudo -n -u "wp-${SITE}" wp --path="$ROOT/current" cache flush --skip-plugins --skip-themes >/dev/null 2>&1 || true
