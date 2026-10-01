@@ -115,9 +115,10 @@ jobs:
 
       - name: Link shared files and activate
         run: |
-          ssh target bash -s <<'REMOTE'
+          # Step env vars live on the runner only; hand them to the remote shell explicitly.
+          ssh target "SITE='$SITE' ROOT='$ROOT' RELEASE='$RELEASE' KEEP='$KEEP' bash -s" <<'REMOTE'
           set -euo pipefail
-          SITE="${SITE}"; ROOT="${ROOT}"; REL="${ROOT}/releases/${RELEASE}"; KEEP="${KEEP}"
+          REL="${ROOT}/releases/${RELEASE}"
           rm -rf "$REL/wp-content/uploads"
           ln -sfn ../../../shared/uploads "$REL/wp-content/uploads"
           # shared/wp-config.php is owned by the site's PHP user (mode 640), so copy it with sudo
