@@ -97,7 +97,9 @@ Rsyncs the repository to a new release directory on a pool droplet, links the sh
 
 **Inputs:** `site` (slug under /var/www), `environment` (`stage` or `production`), `host` (droplet), `url` (optional, smoke-tested after activation), `keep_releases` (default 5).
 
-**Secrets:** `DEPLOY_SSH_KEY` (private key for the droplet's `deploy` user).
+**Secrets:** `DEPLOY_SSH_KEY` (private key for the droplet's `deploy` user); `DO_FIREWALL_TOKEN` (DigitalOcean token scoped to firewall updates) when `firewall_id` is set.
+
+**Firewall handling:** with `firewall_id` set, the job adds the runner's public IP to the cloud firewall on port 22 before deploying and removes it in an `always` step afterwards, so SSH stays closed at rest. Pass `secrets: inherit` from the caller and keep the two secrets at organization level.
 
 **Example caller:**
 
@@ -113,6 +115,8 @@ jobs:
       environment: ${{ github.ref_name == 'main' && 'production' || 'stage' }}
       host: ${{ github.ref_name == 'main' && vars.DO_PROD_HOST || vars.DO_STAGE_HOST }}
       url: https://media.freightwaves.com
+      firewall_id: ${{ vars.DO_FIREWALL_ID }}
     secrets:
       DEPLOY_SSH_KEY: ${{ secrets.DO_DEPLOY_SSH_KEY }}
+      DO_FIREWALL_TOKEN: ${{ secrets.DO_FIREWALL_TOKEN }}
 ```
