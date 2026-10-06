@@ -2,7 +2,7 @@ name: Deploy to DigitalOcean WordPress pool
 
 # Reusable deploy for sites hosted on the DigitalOcean WordPress droplet pool
 # (release layout under /var/www/<site>: releases/<sha>, current symlink,
-# shared/uploads, shared/wp-config.php). Called from each site repo on push
+# shared/uploads, shared/wp-config.php, optional shared/wp-content/*). Called from each site repo on push
 # to stage (stage droplet) and main (prod droplet).
 
 on:
@@ -121,6 +121,19 @@ jobs:
           REL="${ROOT}/releases/${RELEASE}"
           rm -rf "$REL/wp-content/uploads"
           ln -sfn ../../../shared/uploads "$REL/wp-content/uploads"
+          # Optional per-site runtime files that must survive deploys and stay out of git
+          # (e.g. a page-cache drop-in, its cache dir, a plugin's credentials dir): every entry
+          # in shared/wp-content/ replaces the same name in the release's wp-content.
+          if [ -d "$ROOT/shared/wp-content" ]; then
+            for src in "$ROOT"/shared/wp-content/* "$ROOT"/shared/wp-content/.[!.]*; do
+              [ -e "$src" ] || continue
+              name=$(basename "$src")
+              [ "$name" = uploads ] && continue  # uploads is always linked from shared/uploads above
+              rm -rf "$REL/wp-content/$name"
+              ln -sfn "../../../shared/wp-content/$name" "$REL/wp-content/$name"
+              echo "linked shared/wp-content/$name"
+            done
+          fi
           # shared/wp-config.php is owned by the site's PHP user (mode 640), so copy it with sudo
           sudo -n cp "$ROOT/shared/wp-config.php" "$REL/wp-config.php"
           sudo -n chown -R "wp-${SITE}:wp-${SITE}" "$REL"
