@@ -128,6 +128,7 @@ jobs:
             for src in "$ROOT"/shared/wp-content/* "$ROOT"/shared/wp-content/.[!.]*; do
               [ -e "$src" ] || continue
               name=$(basename "$src")
+              [ "$name" = uploads ] && continue  # uploads is always linked from shared/uploads above
               rm -rf "$REL/wp-content/$name"
               ln -sfn "../../../shared/wp-content/$name" "$REL/wp-content/$name"
               echo "linked shared/wp-content/$name"
