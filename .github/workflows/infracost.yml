@@ -33,10 +33,22 @@ jobs:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
       - name: Run Infracost breakdown
+        env:
+          TF_DIR: ${{ inputs.terraform_dir }}
+          TFVARS: ${{ inputs.tfvars_file }}
         run: |
+          # tfvars_file is documented as relative to the repo root, but Infracost
+          # resolves --terraform-var-file relative to --path. Convert it, and pass
+          # the value through unchanged if it is already relative to terraform_dir.
+          if [ -f "$TFVARS" ]; then
+            VAR_FILE="$(realpath --relative-to="$TF_DIR" "$TFVARS")"
+          else
+            VAR_FILE="$TFVARS"
+          fi
+          echo "Infracost var file (relative to $TF_DIR): $VAR_FILE"
           infracost breakdown \
-            --path ${{ inputs.terraform_dir }} \
-            --terraform-var-file ${{ inputs.tfvars_file }} \
+            --path "$TF_DIR" \
+            --terraform-var-file "$VAR_FILE" \
             --format json \
             --out-file /tmp/infracost.json
 
