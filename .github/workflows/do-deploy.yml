@@ -4,6 +4,10 @@ name: Deploy to DigitalOcean WordPress pool
 # (release layout under /var/www/<site>: releases/<sha>, current symlink,
 # shared/uploads, shared/wp-config.php, optional shared/wp-content/*). Called from each site repo on push
 # to stage (stage droplet) and main (prod droplet).
+#
+# An empty `host` skips the deploy with a notice instead of failing. The pool has had no stage droplet
+# since 2026-10-11 (it used the production databases), so the site repos leave DO_STAGE_HOST unset and
+# pushes to stage pass without deploying anywhere.
 
 on:
   workflow_call:
@@ -17,9 +21,10 @@ on:
         required: true
         type: string
       host:
-        description: 'Droplet hostname or IP to deploy to'
-        required: true
+        description: 'Droplet hostname or IP to deploy to. Empty skips the deploy (no droplet for this environment).'
+        required: false
         type: string
+        default: ''
       url:
         description: 'Public URL shown on the environment'
         required: false
@@ -48,8 +53,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  no-host:
+    name: ${{ inputs.site }} -> ${{ inputs.environment }} (no droplet, skipped)
+    if: inputs.host == ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Nothing to deploy to
+        run: echo "::notice::No ${{ inputs.environment }} droplet for ${{ inputs.site }} (host input is empty), so nothing was deployed. Production deploys from main."
+
   deploy:
     name: ${{ inputs.site }} -> ${{ inputs.environment }} (${{ inputs.host }})
+    if: inputs.host != ''
     runs-on: ubuntu-latest
     environment:
       name: ${{ inputs.environment }}
