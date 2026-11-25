@@ -89,6 +89,26 @@ The following workflows predate the Terraform migration and are used by WordPres
 - `vip-sync.yml` — WordPress VIP sync
 - `vip-reverse-sync.yml` — WordPress VIP reverse sync
 
+**Token permissions.** A called workflow's job gets only what the calling job grants, and the caller repos default to a read-only `GITHUB_TOKEN`. If a job here asks for a scope the caller doesn't grant, GitHub refuses to start the run (`startup_failure`, and no check appears on the PR).
+
+- `phpcs.yml` declares no permissions. It runs with the caller's token, and the scan only reads. A repo that runs the manual full scan (`scan_mode: full`, which opens an issue) grants `issues: write` on the calling job:
+
+  ```yaml
+  jobs:
+    phpcs:
+      if: github.repository_owner == 'Firecrown-Media'
+      permissions:
+        contents: read
+        issues: write
+      uses: Firecrown-Media/gh-shared-workflows/.github/workflows/phpcs.yml@main
+      with:
+        scan_mode: ${{ inputs.scan_mode || 'delta' }}
+  ```
+
+- `ai-issue-agent.yml` asks for `contents`, `pull-requests` and `issues: write`, so its calling job must grant all three, as in the infracost example above.
+
+**PHP vulnerability scan** (`security-scan.yml`). It audits the root `composer.json`. A repo without one has no Composer dependencies to audit, so the job passes with a notice.
+
 ---
 
 ### `do-deploy.yml` — Deploy to the DigitalOcean WordPress pool
