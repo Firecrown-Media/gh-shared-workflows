@@ -9,7 +9,7 @@ on:
         type: string
         default: '8.2'
       scan_mode:
-        description: "'delta' scans changed files only; 'full' scans entire repo and opens an issue"
+        description: "'delta' scans changed files only; 'full' scans entire repo and opens an issue (the caller must grant issues: write)"
         required: false
         type: string
         default: 'delta'
@@ -19,9 +19,14 @@ jobs:
     name: PHP_CodeSniffer
     runs-on: ubuntu-latest
     if: vars.ENABLE_PHPCS != 'false'
-    permissions:
-      issues: write
-      contents: read
+    # No job-level permissions on purpose. A called job can only narrow the token
+    # its caller grants, never widen it, and the caller repos now default to a
+    # read-only token. While this job asked for issues: write, GitHub refused to
+    # start it in every caller that didn't grant that scope ("The nested job
+    # 'phpcs' is requesting 'issues: write', but is only allowed 'issues: none'":
+    # startup_failure, and no PHPCS check on the PR), from about 2026-11-12.
+    # The scan only reads. The one step that writes is the full scan's issue,
+    # so a caller that runs full scans grants issues: write itself (README).
 
     # Private-package Composer auth via an ORG-OWNED GitHub App. This block is a
     # straight port of the one added to security-scan.yml on 2026-07-08 (5cf95fc)
@@ -154,4 +159,7 @@ jobs:
           gh issue create \
             --repo "${{ github.repository }}" \
             --title "PHPCS full scan baseline — $DATE" \
-            --body-file "$BODY_FILE"
+            --body-file "$BODY_FILE" || {
+            echo "::error::Opening the issue needs issues: write, and this job's token only has what the caller grants. Add 'permissions: { contents: read, issues: write }' to the job that calls phpcs.yml (see README)."
+            exit 1
+          }

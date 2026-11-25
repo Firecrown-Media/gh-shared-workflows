@@ -24,6 +24,8 @@ Centralized GitHub Actions reusable workflows for all Firecrown WordPress VIP si
 
 **Feature flags**: All jobs have an `if: vars.ENABLE_* != 'false'` guard. Flags are set as repository variables on each caller repo. Variables not set default to `'true'` (enabled). `ENABLE_DEPENDENCY_AUDIT` and `ENABLE_SECRET_SCAN` are set to `'false'` at scaffold time.
 
+**Token permissions**: A called job can only narrow the token its caller grants, and the caller repos default to a read-only `GITHUB_TOKEN`. A job here that declares a write scope refuses to start (`startup_failure`, no check on the PR) in every caller that doesn't grant it. Declare job-level permissions only when every run needs them, and document the grant in the README (`infracost.yml`, `ai-issue-agent.yml`). Otherwise leave them to the caller, as `phpcs.yml` does for the issue its manual full scan opens.
+
 **`repository_owner` guard**: Caller workflows in site repos include `if: github.repository_owner == 'Firecrown-Media'` on every job. This prevents the workflows from firing on the `wpcomvip` side when VIP sync copies `.github/workflows/` into the VIP repo.
 
 ## Editing Workflows
