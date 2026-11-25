@@ -31,7 +31,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # No composer.json means no Composer dependencies to audit. The `lean` VIP
+      # sites ship none, and on those `composer install` failed on every run
+      # ("Composer could not find a composer.json file"), so the check was red on
+      # every PR and audited nothing. Skip with a notice instead, the way
+      # dependency-audit below skips a repo with no package-lock.json. A repo
+      # with a composer.json runs exactly the steps it always did.
+      - name: Find composer.json
+        id: discover
+        run: |
+          if [ -f composer.json ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No composer.json at the repository root — no Composer dependencies to audit, skipping. Expected for lean VIP sites."
+          fi
+
       - name: Set up PHP ${{ inputs.php_version }}
+        if: steps.discover.outputs.found == 'true'
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ inputs.php_version }}
@@ -39,7 +56,7 @@ jobs:
 
       - name: Mint Composer auth token (GitHub App)
         id: composer_auth
-        if: ${{ env.COMPOSER_APP_ID != '' }}
+        if: ${{ steps.discover.outputs.found == 'true' && env.COMPOSER_APP_ID != '' }}
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.COMPOSER_APP_ID }}
@@ -51,9 +68,11 @@ jobs:
         run: composer config --global github-oauth.github.com "${{ steps.composer_auth.outputs.token }}"
 
       - name: Install dependencies
+        if: steps.discover.outputs.found == 'true'
         run: composer install --no-interaction --no-progress
 
       - name: Check for known vulnerabilities
+        if: steps.discover.outputs.found == 'true'
         run: composer audit --no-interaction
 
   dependency-audit:
